@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -99,6 +99,12 @@ ELEVENLABS_VOICES = {
 DEFAULT_VOICE = "Rachel"
 
 
+# One-click color grading presets, applied at render time via ffmpeg's eq/
+# colorbalance/hue filters — no separate render pass, just extra filter
+# chain stages before the caption burn-in.
+COLOR_PRESETS = ["none", "warm", "moody", "vibrant", "bw", "cinematic"]
+
+
 class ProcessRequest(BaseModel):
     url: str
     clip_count: int = 3
@@ -107,6 +113,8 @@ class ProcessRequest(BaseModel):
                             # e.g. "focus on the part where they argue about money"
     voiceover: bool = False           # force AI voice-over even if the clip has speech
     voiceover_voice: str = DEFAULT_VOICE
+    zoom_pan: bool = False             # subtle continuous Ken Burns-style zoom-in
+    color_preset: str = "none"         # one of COLOR_PRESETS
 
 
 class ReclipRequest(BaseModel):
@@ -117,6 +125,8 @@ class ReclipRequest(BaseModel):
     exclude_starts: List[float] = []  # start times already used, so auto-pick doesn't repeat them
     voiceover: bool = False
     voiceover_voice: str = DEFAULT_VOICE
+    zoom_pan: bool = False
+    color_preset: str = "none"
 
 
 class RegenerateVoiceoverRequest(BaseModel):
@@ -177,13 +187,17 @@ def download_video(url: str, dest: Path) -> Path:
     # YouTube now requires a "PO token" for some of its player clients
     # (notably the default "web" client), which yt-dlp can't always obtain
     # server-side — this shows up as "Sign in to confirm you're not a bot"
-    # or HTTP 429 even for public videos. The android/ios/tv embedded
-    # clients use a different auth flow that usually doesn't need a PO
-    # token, so we try those first and only fall back to the default
-    # (web) client if they fail. Trying several clients in one process
-    # also means a single transient failure doesn't require restarting
-    # the whole clip request.
-    client_attempts = ["android", "ios", "tv", "web"]
+    # or HTTP 429 even for public videos. The embedded/mobile clients use a
+    # different auth flow that usually doesn't need a PO token, so we try
+    # those first and only fall back to "web" last. mweb and web_creator
+    # are included because as of 2026 they're commonly the two that still
+    # get through when android/ios/tv have started requiring PO tokens too
+    # (YouTube's specific bot-check requirements shift client-by-client
+    # over time, which is also why the Dockerfile force-upgrades yt-dlp on
+    # every build instead of trusting whatever version got cached). Trying
+    # several clients in one process also means a single transient failure
+    # doesn't require restarting the whole clip request.
+    client_attempts = ["android", "ios", "tv", "mweb", "web_creator", "web"]
     last_error = ""
     for client in client_attempts:
         args = base_args + ["--extractor-args", f"youtube:player_client={client}"]
@@ -199,10 +213,11 @@ def download_video(url: str, dest: Path) -> Path:
 
     hint = (
         "\n\nYouTube is blocking downloads from this server (common for cloud-hosted "
-        "IPs). The most reliable fix is providing YouTube cookies from a logged-in "
-        "browser session — export them with a browser extension like \"Get "
-        "cookies.txt LOCALLY\" and set them as the YTDLP_COOKIES environment "
-        "variable on this service."
+        "IPs). Two fixes: (1) use the \"Upload your own video\" option instead — it "
+        "skips YouTube entirely, or (2) for a permanent fix on pasted links, provide "
+        "YouTube cookies from a logged-in browser session — export them with a "
+        "browser extension like \"Get cookies.txt LOCALLY\" and set them as the "
+        "YTDLP_COOKIES environment variable on this service."
     ) if not YTDLP_COOKIES else ""
     raise RuntimeError(f"yt-dlp failed on all player clients: {last_error}{hint}")
 
@@ -546,9 +561,47 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
     ass_path.write_text("".join(lines), encoding="utf-8")
 
 
-def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path):
-    """Cuts the clip, reframes to 9:16, and burns in the animated
-    karaoke captions — all via ffmpeg.
+def _zoompan_filter(fps: int = 30) -> str:
+    """A slow, continuous zoom-in (subtle Ken Burns effect) applied
+    directly to normal video frames — d=1 keeps one output frame per
+    input frame instead of zoompan's default image-slideshow behavior,
+    which is what lets this run on a real video clip instead of a still.
+    The zoom grows a tiny amount every frame and is capped at 1.15x so
+    the crop window never tightens enough to clip into the caption
+    safe-margins burned in afterward."""
+    return (
+        "zoompan=z='min(zoom+0.0008,1.15)':d=1:"
+        "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"s=1080x1920:fps={fps}"
+    )
+
+
+def _color_grade_filter(preset: str) -> str:
+    """Returns an ffmpeg filter fragment for a named look, or "" for
+    'none'/unknown presets (caller just skips this stage). These are
+    built from eq (brightness/contrast/saturation/gamma) and colorbalance
+    (per-channel shadow/midtone push) rather than external LUTs, so no
+    extra files need to ship with the service."""
+    presets = {
+        "warm": "eq=contrast=1.05:brightness=0.02:saturation=1.15,"
+                "colorbalance=rs=0.08:gs=0.02:bs=-0.08:rm=0.06:bm=-0.06",
+        "moody": "eq=contrast=1.15:brightness=-0.03:saturation=0.85:gamma=0.92,"
+                 "colorbalance=bs=0.08:bm=0.05",
+        "vibrant": "eq=contrast=1.1:saturation=1.4:brightness=0.01",
+        "bw": "hue=s=0,eq=contrast=1.15",
+        "cinematic": "eq=contrast=1.12:saturation=0.9:gamma=0.95,"
+                     "colorbalance=rs=0.04:bs=0.06:rm=0.02:bm=0.04",
+    }
+    return presets.get(preset, "")
+
+
+def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
+                     zoom_pan: bool = False, color_preset: str = "none"):
+    """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
+    and/or a color grading preset, and burns in the animated karaoke
+    captions — all via ffmpeg. Captions are always the LAST filter stage so
+    they stay crisp on top of any zoom/color grading rather than getting
+    color-graded or zoomed themselves.
 
     The ass/subtitles filters' path handling is notoriously fragile on
     Windows: ffmpeg's filtergraph mini-language uses ':' to separate
@@ -563,11 +616,18 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     ass_dir = ass_path.parent.resolve()
     ass_name = ass_path.name  # bare filename — no separators, nothing to escape
 
-    vf = (
-        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',"
-        "scale=1080:1920,"
-        f"ass='{ass_name}'"
-    )
+    vf_stages = [
+        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'",
+        "scale=1080:1920",
+    ]
+    if zoom_pan:
+        vf_stages.append(_zoompan_filter())
+    if color_preset and color_preset != "none":
+        cg = _color_grade_filter(color_preset)
+        if cg:
+            vf_stages.append(cg)
+    vf_stages.append(f"ass='{ass_name}'")
+    vf = ",".join(vf_stages)
     # -threads 2: without this, libx264 auto-detects the host's full core
     # count (60+ on some Railway hosts) and allocates per-thread buffers
     # accordingly, which was spiking memory usage enough to get the process
@@ -766,23 +826,16 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-@app.post("/process")
-def process(req: ProcessRequest):
-    cleanup_old_jobs()
-
-    job_id = str(uuid.uuid4())[:8]
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        source = download_video(req.url, job_dir)
-    except Exception as e:
-        raise HTTPException(400, f"Could not download video: {e}")
-
+def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, clip_seconds: int,
+                     instruction: str, voiceover: bool, voiceover_voice: str,
+                     zoom_pan: bool, color_preset: str, source_url: str = "") -> dict:
+    """Shared pipeline body for both /process (download-from-URL) and
+    /process-upload (user's own file) — everything after "we have a
+    source.mp4 on disk" is identical between the two entry points."""
     try:
         duration = get_duration(source)
     except Exception as e:
-        raise HTTPException(500, f"Downloaded video seems invalid: {e}")
+        raise HTTPException(500, f"Video seems invalid: {e}")
 
     try:
         audio = extract_audio(source, job_dir)
@@ -795,9 +848,9 @@ def process(req: ProcessRequest):
     # or re-transcribing (both slow, and repeat downloads are part of what
     # triggers YouTube's rate limiting).
     (job_dir / "words.json").write_text(json.dumps(words))
-    (job_dir / "meta.json").write_text(json.dumps({"duration": duration, "url": req.url}))
+    (job_dir / "meta.json").write_text(json.dumps({"duration": duration, "url": source_url}))
 
-    highlights = pick_highlights(words, req.clip_count, req.clip_seconds, duration, req.instruction)
+    highlights = pick_highlights(words, clip_count, clip_seconds, duration, instruction)
 
     if not highlights:
         raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")
@@ -811,13 +864,14 @@ def process(req: ProcessRequest):
         out_path = OUTPUT_DIR / out_name
 
         try:
-            cut_and_caption(source, h["start"], h["end"], ass_path, out_path)
+            cut_and_caption(source, h["start"], h["end"], ass_path, out_path,
+                             zoom_pan=zoom_pan, color_preset=color_preset)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
         voiceover_script = apply_voiceover_if_wanted(
-            source, job_dir, out_path, h["start"], h["end"], req.clip_seconds,
-            words, req.voiceover, req.voiceover_voice, req.instruction,
+            source, job_dir, out_path, h["start"], h["end"], clip_seconds,
+            words, voiceover, voiceover_voice, instruction,
         )
 
         clips.append({
@@ -831,6 +885,80 @@ def process(req: ProcessRequest):
         })
 
     return {"job_id": job_id, "clip_count": len(clips), "clips": clips}
+
+
+@app.post("/process")
+def process(req: ProcessRequest):
+    cleanup_old_jobs()
+
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        source = download_video(req.url, job_dir)
+    except Exception as e:
+        raise HTTPException(400, f"Could not download video: {e}")
+
+    return _process_source(
+        source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
+        req.voiceover, req.voiceover_voice, req.zoom_pan, req.color_preset, req.url,
+    )
+
+
+# Upload size cap: keeps a single request from blowing out Railway's small
+# ephemeral volume / container memory. 500MB comfortably covers a phone
+# video several minutes long at 1080p.
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
+
+@app.post("/process-upload")
+async def process_upload(
+    file: UploadFile = File(...),
+    clip_count: int = Form(3),
+    clip_seconds: int = Form(30),
+    instruction: str = Form(""),
+    voiceover: bool = Form(False),
+    voiceover_voice: str = Form(DEFAULT_VOICE),
+    zoom_pan: bool = Form(False),
+    color_preset: str = Form("none"),
+):
+    """Same pipeline as /process, but for a video the user uploads directly
+    instead of a YouTube/Twitch/etc URL — skips yt-dlp entirely, so this
+    also sidesteps YouTube's bot-detection/rate-limiting altogether."""
+    cleanup_old_jobs()
+
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    source = job_dir / "source.mp4"
+    size = 0
+    try:
+        with open(source, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Video is too large (500MB max). Try a shorter or lower-resolution file.")
+                f.write(chunk)
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f"Could not read uploaded file: {e}")
+
+    if size == 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    return _process_source(
+        source, job_dir, job_id, clip_count, clip_seconds, instruction,
+        voiceover, voiceover_voice, zoom_pan, color_preset, "uploaded file",
+    )
 
 
 @app.post("/reclip")
@@ -867,7 +995,8 @@ def reclip(req: ReclipRequest):
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name
     try:
-        cut_and_caption(source, start, end, ass_path, out_path)
+        cut_and_caption(source, start, end, ass_path, out_path,
+                         zoom_pan=req.zoom_pan, color_preset=req.color_preset)
     except Exception as e:
         raise HTTPException(500, f"Failed to render clip: {e}")
 
@@ -917,6 +1046,11 @@ def list_voices():
     return {"voices": list(ELEVENLABS_VOICES.keys()), "default": DEFAULT_VOICE}
 
 
+@app.get("/color-presets")
+def list_color_presets():
+    return {"presets": COLOR_PRESETS, "default": "none"}
+
+
 @app.get("/health")
 def health():
     return {
@@ -925,4 +1059,7 @@ def health():
         "highlight_picking": "claude" if ANTHROPIC_API_KEY else "heuristic fallback",
         "youtube_cookies": "configured" if YTDLP_COOKIES else "not set (may hit YouTube bot checks)",
         "voiceover": "elevenlabs" if ELEVENLABS_API_KEY else "not configured",
+        "direct_upload": "enabled",
+        "zoom_pan": "enabled",
+        "color_grading": "enabled",
     }

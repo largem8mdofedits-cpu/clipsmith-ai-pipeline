@@ -82,8 +82,19 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 # Optional: raw contents of a YouTube cookies.txt (Netscape format), from a
 # logged-in browser session. Paste it as a single Railway variable value —
 # see download_video() below for why this helps with YouTube's bot checks.
+# Note: some of the cookies YouTube issues (SIDCC, PSIDTS) are short-lived
+# security tokens Google auto-rotates as normal session hygiene, so an
+# exported snapshot can go stale within hours — cookies alone aren't a
+# permanent fix, just a temporary boost, hence the POT provider below.
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+
+# URL of a self-hosted bgutil-ytdlp-pot-provider instance (see
+# https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — generates
+# proof-of-origin tokens that help yt-dlp's traffic look legitimate to
+# YouTube from a datacenter IP. Not a guaranteed bypass (YouTube's own docs
+# say so), but a free, real improvement with no account/cookies required.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").rstrip("/")
 
 # A handful of ElevenLabs' stable premade voice IDs, exposed under friendly
 # names for the frontend's voice picker. (These IDs are ElevenLabs' own
@@ -229,6 +240,13 @@ def download_video(url: str, dest: Path) -> Path:
         "--remote-components", "ejs:github",
         "--js-runtimes", "deno",
     ]
+    # Point yt-dlp at our self-hosted PO token provider (see
+    # POT_PROVIDER_URL above) so its bgutil plugin can fetch a
+    # proof-of-origin token — this is a separate --extractor-args flag
+    # from the per-client one below since it targets a different
+    # extractor ("youtubepot-bgutilhttp" vs "youtube").
+    if POT_PROVIDER_URL:
+        base_args += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
 
     # Optional: a real YouTube session's cookies, exported by the site owner
     # and set as the YTDLP_COOKIES env var (Netscape cookies.txt format).
@@ -270,12 +288,10 @@ def download_video(url: str, dest: Path) -> Path:
 
     hint = (
         "\n\nYouTube is blocking downloads from this server (common for cloud-hosted "
-        "IPs). Two fixes: (1) use the \"Upload your own video\" option instead — it "
-        "skips YouTube entirely, or (2) for a permanent fix on pasted links, provide "
-        "YouTube cookies from a logged-in browser session — export them with a "
-        "browser extension like \"Get cookies.txt LOCALLY\" and set them as the "
-        "YTDLP_COOKIES environment variable on this service."
-    ) if not YTDLP_COOKIES else ""
+        "IPs, even with a PO token provider and cookies configured — YouTube doesn't "
+        "guarantee either bypasses its bot checks). Use the \"Upload your own video\" "
+        "option instead — it skips YouTube entirely and always works."
+    )
     raise RuntimeError(f"yt-dlp failed on all player clients: {last_error}{hint}")
 
 
@@ -1058,6 +1074,8 @@ def download_bg_music(url: str, dest: Path) -> Optional[Path]:
             "yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "m4a",
             "--no-playlist", "--extractor-args", f"youtube:player_client={client}",
         ]
+        if POT_PROVIDER_URL:
+            args += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
         if cookies_path:
             args += ["--cookies", str(cookies_path)]
         args += ["-o", out_template, url]
@@ -1436,6 +1454,7 @@ def health():
         "transcription": "deepgram" if DEEPGRAM_API_KEY else "not configured",
         "highlight_picking": "claude" if ANTHROPIC_API_KEY else "heuristic fallback",
         "youtube_cookies": "configured" if YTDLP_COOKIES else "not set (may hit YouTube bot checks)",
+        "pot_provider": "configured" if POT_PROVIDER_URL else "not set",
         "voiceover": "elevenlabs" if ELEVENLABS_API_KEY else "not configured",
         "direct_upload": "enabled",
         "zoom_pan": "enabled",

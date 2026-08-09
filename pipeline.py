@@ -1247,7 +1247,18 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
             "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
         })
 
-    return {"job_id": job_id, "clip_count": len(clips), "clips": clips}
+    # source_bytes/is_youtube let the frontend report proxy bandwidth usage
+    # back to the billing backend accurately: uploads never touch the
+    # proxy (is_youtube=False, frontend won't report it as proxy usage),
+    # while a YouTube-link job's source_bytes IS what got pulled through
+    # the proxy to download it.
+    return {
+        "job_id": job_id,
+        "clip_count": len(clips),
+        "clips": clips,
+        "source_bytes": source.stat().st_size if source.exists() else 0,
+        "is_youtube": source_url not in ("", "uploaded file"),
+    }
 
 
 @app.post("/process")

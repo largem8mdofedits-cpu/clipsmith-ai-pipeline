@@ -1242,6 +1242,9 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
             "url": f"/clips/{out_name}",
             "voiceover_script": voiceover_script,
             "has_voiceover": voiceover_script is not None,
+            # Lets the frontend meter free-tier MB usage against the real
+            # rendered file instead of guessing from clip duration.
+            "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
         })
 
     return {"job_id": job_id, "clip_count": len(clips), "clips": clips}
@@ -1393,6 +1396,7 @@ def reclip(req: ReclipRequest):
         "url": f"/clips/{out_name}",
         "voiceover_script": voiceover_script,
         "has_voiceover": voiceover_script is not None,
+        "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
     }
 
 

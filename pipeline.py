@@ -436,7 +436,13 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         cwd=str(ass_dir),  # <-- this is what makes the bare filename resolve correctly
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr[-800:]}")
+        # Print the FULL stderr to the server's own logs (Railway captures
+        # stdout/stderr) since the exception message shown to the client is
+        # truncated — the real cause is often earlier in ffmpeg's output
+        # than what fits in that truncated tail.
+        print(f"ffmpeg command: {' '.join(['ffmpeg','-y','-ss',str(start),'-i',str(source.resolve()),'-t',str(duration),'-vf',vf,'-c:v','libx264','-preset','veryfast','-c:a','aac',str(out_path.resolve())])}")
+        print(f"ffmpeg full stderr:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2500:]}")
 
 
 # ---------------------------------------------------------------------------

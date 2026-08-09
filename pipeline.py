@@ -14,13 +14,16 @@ Then POST a video URL to http://localhost:8000/process
 See README.md in this folder for full setup instructions.
 """
 
+import base64
 import os
 import json
 import re
+import shutil
 import subprocess
-import tempfile
+import time
 import uuid
 from pathlib import Path
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -46,12 +49,54 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # this, the URLs returned by /process below 404.
 app.mount("/clips", StaticFiles(directory=str(OUTPUT_DIR)), name="clips")
 
+# Each /process call gets a job directory here (source video + transcript +
+# metadata) that OUTLIVES the request, instead of the old tempfile approach
+# that deleted everything the instant the response was sent. This is what
+# lets /reclip regenerate a different moment from the SAME video without
+# re-downloading it — important both for speed and because repeat downloads
+# were part of what triggered YouTube's rate limiting in the first place.
+JOBS_DIR = Path(__file__).parent / "jobs"
+JOBS_DIR.mkdir(exist_ok=True)
+JOB_TTL_SECONDS = 3 * 60 * 60  # old job folders are swept on a delay, not kept forever
+
+
+def cleanup_old_jobs():
+    """Deletes job folders older than JOB_TTL_SECONDS. Called at the start
+    of /process so disk usage on Railway's (small, ephemeral) volume stays
+    bounded without needing a separate cron job."""
+    now = time.time()
+    for job_dir in JOBS_DIR.iterdir():
+        try:
+            if job_dir.is_dir() and (now - job_dir.stat().st_mtime) > JOB_TTL_SECONDS:
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception as e:
+            print(f"Job cleanup skipped {job_dir}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Config — all via env vars so this runs the same locally and on Railway.
 # ---------------------------------------------------------------------------
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+# Optional: raw contents of a YouTube cookies.txt (Netscape format), from a
+# logged-in browser session. Paste it as a single Railway variable value —
+# see download_video() below for why this helps with YouTube's bot checks.
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+
+# A handful of ElevenLabs' stable premade voice IDs, exposed under friendly
+# names for the frontend's voice picker. (These IDs are ElevenLabs' own
+# public premade voices, not anything tied to this account.)
+ELEVENLABS_VOICES = {
+    "Rachel": "21m00Tcm4TlvDq8ikWAM",   # calm, female, US
+    "Adam":   "pNInz6obpgDQGcFmaJgB",   # deep, male, US
+    "Bella":  "EXAVITQu4vr4xnSDxMaL",   # soft, female, US
+    "Antoni": "ErXwobaYiN019PkySvjV",   # warm, male, US
+    "Elli":   "MF3mGyEYCl7XYWbV9V6O",   # young, female, US
+    "Josh":   "TxGEqnHWrfWFTfGW9XjX",   # casual, male, US
+}
+DEFAULT_VOICE = "Rachel"
 
 
 class ProcessRequest(BaseModel):
@@ -60,6 +105,25 @@ class ProcessRequest(BaseModel):
     clip_seconds: int = 30
     instruction: str = ""  # optional free-text steer for Claude's highlight picking,
                             # e.g. "focus on the part where they argue about money"
+    voiceover: bool = False           # force AI voice-over even if the clip has speech
+    voiceover_voice: str = DEFAULT_VOICE
+
+
+class ReclipRequest(BaseModel):
+    job_id: str
+    start: Optional[float] = None     # explicit new start time; omit to auto-pick a fresh moment
+    clip_seconds: int = 20
+    instruction: str = ""
+    exclude_starts: List[float] = []  # start times already used, so auto-pick doesn't repeat them
+    voiceover: bool = False
+    voiceover_voice: str = DEFAULT_VOICE
+
+
+class RegenerateVoiceoverRequest(BaseModel):
+    job_id: str
+    clip_file: str        # the "file" value from a previous clip response, e.g. "70b799b2_0.mp4"
+    script: str            # user-edited narration text
+    voice: str = DEFAULT_VOICE
 
 
 # ---------------------------------------------------------------------------
@@ -82,31 +146,65 @@ def download_video(url: str, dest: Path) -> Path:
     README) — without it, downloads fail with a JS-runtime error.
     """
     out_path = dest / "source.mp4"
-    result = subprocess.run(
-        ["yt-dlp",
-         # Capped at 1080p: the final output is always cropped/scaled to
-         # 1080x1920 anyway, so pulling a 4K (or higher) source just wastes
-         # bandwidth and — more importantly — makes the later ffmpeg decode
-         # step dramatically more memory-hungry. On a resource-limited
-         # Railway container, decoding a 4K AV1 source was silently
-         # OOM-killing the ffmpeg render step with no error message at all
-         # (process just died right after starting, 0 frames encoded).
-         "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[height<=1080]/best",
-         "--merge-output-format", "mp4",
-         "--no-playlist",
-         "--remote-components", "ejs:github",
-         "--js-runtimes", "deno",
-         "-o", str(out_path), url],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {result.stderr[-800:]}")
-    if not out_path.exists():
-        raise RuntimeError(
-            f"yt-dlp reported success but {out_path} wasn't created — "
-            f"check that ffmpeg is on PATH (needed for merging).\n{result.stdout[-500:]}"
-        )
-    return out_path
+
+    base_args = [
+        "yt-dlp",
+        # Capped at 1080p: the final output is always cropped/scaled to
+        # 1080x1920 anyway, so pulling a 4K (or higher) source just wastes
+        # bandwidth and — more importantly — makes the later ffmpeg decode
+        # step dramatically more memory-hungry. On a resource-limited
+        # Railway container, decoding a 4K AV1 source was silently
+        # OOM-killing the ffmpeg render step with no error message at all
+        # (process just died right after starting, 0 frames encoded).
+        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[height<=1080]/best",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--remote-components", "ejs:github",
+        "--js-runtimes", "deno",
+    ]
+
+    # Optional: a real YouTube session's cookies, exported by the site owner
+    # and set as the YTDLP_COOKIES env var (Netscape cookies.txt format).
+    # YouTube increasingly rate-limits / bot-checks requests from datacenter
+    # IPs like Railway's — a logged-in session's cookies are the most
+    # reliable fix when that happens. Optional: if unset, we just don't
+    # pass --cookies and rely on the client-spoofing fallbacks below.
+    cookies_path = None
+    if YTDLP_COOKIES:
+        cookies_path = dest / "cookies.txt"
+        cookies_path.write_text(YTDLP_COOKIES, encoding="utf-8")
+
+    # YouTube now requires a "PO token" for some of its player clients
+    # (notably the default "web" client), which yt-dlp can't always obtain
+    # server-side — this shows up as "Sign in to confirm you're not a bot"
+    # or HTTP 429 even for public videos. The android/ios/tv embedded
+    # clients use a different auth flow that usually doesn't need a PO
+    # token, so we try those first and only fall back to the default
+    # (web) client if they fail. Trying several clients in one process
+    # also means a single transient failure doesn't require restarting
+    # the whole clip request.
+    client_attempts = ["android", "ios", "tv", "web"]
+    last_error = ""
+    for client in client_attempts:
+        args = base_args + ["--extractor-args", f"youtube:player_client={client}"]
+        if cookies_path:
+            args += ["--cookies", str(cookies_path)]
+        args += ["-o", str(out_path), url]
+
+        result = subprocess.run(args, capture_output=True, text=True)
+        if result.returncode == 0 and out_path.exists():
+            return out_path
+        last_error = result.stderr[-1200:]
+        print(f"yt-dlp attempt with player_client={client} failed, trying next client if any:\n{last_error}")
+
+    hint = (
+        "\n\nYouTube is blocking downloads from this server (common for cloud-hosted "
+        "IPs). The most reliable fix is providing YouTube cookies from a logged-in "
+        "browser session — export them with a browser extension like \"Get "
+        "cookies.txt LOCALLY\" and set them as the YTDLP_COOKIES environment "
+        "variable on this service."
+    ) if not YTDLP_COOKIES else ""
+    raise RuntimeError(f"yt-dlp failed on all player clients: {last_error}{hint}")
 
 
 def extract_audio(video_path: Path, dest: Path) -> Path:
@@ -206,7 +304,7 @@ def build_timestamped_transcript(words, bucket_seconds: int = 10) -> str:
     return "\n".join(lines)
 
 
-def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = ""):
+def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = "", exclude_ranges=None):
     """Asks Claude to pick the best moments in the video for short-form
     clips — hooks, punchlines, surprising or emotional beats — rather than
     just the windows with the most words in them. Returns None (so the
@@ -218,7 +316,11 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
     on the part where they argue about money", "find the funniest moment")
     — when present it's given priority over the generic hook/punchline
     criteria, letting the user directly control what the AI looks for
-    instead of only ever getting one fixed notion of "best"."""
+    instead of only ever getting one fixed notion of "best".
+
+    `exclude_ranges` is an optional list of (start, end) tuples the caller
+    already has clips from — used by /reclip's "pick a different moment"
+    so regenerating doesn't just hand back the same window again."""
     if not ANTHROPIC_API_KEY or not words:
         return None
 
@@ -230,12 +332,18 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
         f"remaining clips if the instruction doesn't specify enough moments.\n\n"
         if instruction else ""
     )
+    exclude_note = (
+        "Avoid these time ranges (already used for other clips): "
+        + ", ".join(f"{s:.0f}s-{e:.0f}s" for s, e in exclude_ranges) + ".\n\n"
+        if exclude_ranges else ""
+    )
     prompt = (
         f"You're picking the {clip_count} best {clip_seconds}-second moments from this "
         f"video transcript, to turn into short-form clips for TikTok/Reels/Shorts. Look "
         f"for hooks, punchlines, surprising claims, or emotional beats — not just the "
         f"parts with the most talking.\n\n"
         f"{steer}"
+        f"{exclude_note}"
         f"Transcript (format: [seconds] words spoken from that point):\n{transcript}\n\n"
         f"The video is {total_duration:.0f} seconds long. Pick {clip_count} start times, "
         f"each at least {clip_seconds} seconds before the video ends, and at least "
@@ -271,11 +379,16 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
         match = re.search(r"\[.*\]", text, re.DOTALL)
         picks = json.loads(match.group(0) if match else text)
 
+        def overlaps_excluded(start, end):
+            return any(not (end <= ex[0] or start >= ex[1]) for ex in (exclude_ranges or []))
+
         highlights = []
         for p in picks[:clip_count]:
             start = max(0.0, float(p["start"]))
             end = min(total_duration, start + clip_seconds)
             if end - start < clip_seconds * 0.5:
+                continue
+            if overlaps_excluded(start, end):
                 continue
             highlights.append({"start": start, "end": end, "reason": p.get("reason", "")})
 
@@ -286,7 +399,7 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
         return None
 
 
-def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_duration: float):
+def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_duration: float, exclude_ranges=None):
     """Speech-density fallback: scores fixed-length windows by how many
     words land in them and returns the top non-overlapping windows. Used
     when no ANTHROPIC_API_KEY is set, or if the LLM call fails for any
@@ -295,6 +408,7 @@ def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_d
     if not words:
         return []
 
+    exclude_ranges = exclude_ranges or []
     stride = max(5, clip_seconds // 3)
     candidates = []
     t = 0.0
@@ -309,19 +423,20 @@ def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_d
     for c in candidates:
         if len(chosen) >= clip_count:
             break
-        overlaps = any(not (c["end"] <= x["start"] or c["start"] >= x["end"]) for x in chosen)
-        if not overlaps:
+        overlaps_chosen = any(not (c["end"] <= x["start"] or c["start"] >= x["end"]) for x in chosen)
+        overlaps_excluded = any(not (c["end"] <= ex[0] or c["start"] >= ex[1]) for ex in exclude_ranges)
+        if not overlaps_chosen and not overlaps_excluded:
             chosen.append(c)
 
     chosen.sort(key=lambda c: c["start"])
     return chosen
 
 
-def pick_highlights(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = ""):
-    llm_picks = pick_highlights_llm(words, clip_count, clip_seconds, total_duration, instruction)
+def pick_highlights(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = "", exclude_ranges=None):
+    llm_picks = pick_highlights_llm(words, clip_count, clip_seconds, total_duration, instruction, exclude_ranges)
     if llm_picks:
         return llm_picks
-    return pick_highlights_heuristic(words, clip_count, clip_seconds, total_duration)
+    return pick_highlights_heuristic(words, clip_count, clip_seconds, total_duration, exclude_ranges)
 
 
 # ---------------------------------------------------------------------------
@@ -467,58 +582,328 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {result.stderr[-2500:]}")
 
 
+def clip_word_count(words, start: float, end: float) -> int:
+    return len([w for w in words if start <= w["start"] < end])
+
+
+# ---------------------------------------------------------------------------
+# Voice-over — Claude (vision) writes the script, ElevenLabs speaks it
+# ---------------------------------------------------------------------------
+def extract_sample_frames(source: Path, start: float, end: float, dest: Path, n: int = 3) -> List[Path]:
+    """Grabs n evenly-spaced still frames from [start, end] so Claude can
+    "see" what's happening in a clip that has no dialogue to transcribe."""
+    frames = []
+    span = max(end - start, 1.0)
+    for i in range(1, n + 1):
+        t = start + span * (i / (n + 1))
+        out = dest / f"vo_frame_{uuid.uuid4().hex[:6]}_{i}.jpg"
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(t), "-i", str(source.resolve()), "-frames:v", "1", "-q:v", "3", str(out)],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and out.exists():
+            frames.append(out)
+        else:
+            print(f"Frame grab at {t:.1f}s failed: {result.stderr[-300:]}")
+    return frames
+
+
+def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instruction: str = "") -> str:
+    """Asks Claude to look at sampled frames and write a short narration
+    script sized to fit the clip's duration. Returns "" (never raises) on
+    any failure so a bad script never blocks the rest of clip generation —
+    the caller just skips voice-over for that clip."""
+    if not ANTHROPIC_API_KEY or not frame_paths:
+        return ""
+
+    words_budget = max(8, int(clip_seconds * 2.5))  # ~2.5 spoken words/sec is a natural narration pace
+    steer = f' The creator specifically asked for: "{instruction}".' if instruction else ""
+
+    content = []
+    for fp in frame_paths:
+        try:
+            b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+        except Exception:
+            continue
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
+    if not content:
+        return ""
+    content.append({
+        "type": "text",
+        "text": (
+            f"These are frames sampled evenly across a {clip_seconds}-second video clip that has "
+            f"no spoken dialogue (music-only or silent). Write a short, punchy voice-over narration "
+            f"script for it, the kind that works over a TikTok/Reels/Shorts clip. Aim for about "
+            f"{words_budget} words so it fits {clip_seconds} seconds read at a natural pace."
+            f"{steer} Respond with ONLY the narration text — no quotes, no stage directions, no "
+            f"timestamps."
+        ),
+    })
+
+    try:
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            print(f"Anthropic API error (voiceover script) {resp.status_code}: {resp.text[:1000]}")
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"Voiceover script generation failed: {e}")
+        return ""
+
+
+def synthesize_voiceover(script: str, voice_name: str, dest: Path) -> Optional[Path]:
+    """Calls ElevenLabs to turn a script into speech. Returns None (never
+    raises) on any failure — same "degrade gracefully" pattern as the rest
+    of this pipeline, since voice-over is always an enhancement, never a
+    requirement for a clip to come back successfully."""
+    if not ELEVENLABS_API_KEY or not script.strip():
+        return None
+
+    voice_id = ELEVENLABS_VOICES.get(voice_name, ELEVENLABS_VOICES[DEFAULT_VOICE])
+    try:
+        resp = httpx.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            json={
+                "text": script,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print(f"ElevenLabs error {resp.status_code}: {resp.text[:500]}")
+            return None
+        audio_path = dest / f"voiceover_{uuid.uuid4().hex[:8]}.mp3"
+        audio_path.write_bytes(resp.content)
+        return audio_path
+    except Exception as e:
+        print(f"ElevenLabs request failed: {e}")
+        return None
+
+
+def mux_voiceover(clip_path: Path, voiceover_path: Path, out_path: Path) -> bool:
+    """Replaces a clip's audio track entirely with the synthesized
+    narration (these are silent/music-only clips by the time we get here,
+    so there's no dialogue to preserve or mix under). -shortest keeps the
+    output in sync with whichever of the two streams is shorter."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(clip_path.resolve()),
+        "-i", str(voiceover_path.resolve()),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        str(out_path.resolve()),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Voiceover mux failed: {result.stderr[-1500:]}")
+        return False
+    return True
+
+
+def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start: float, end: float,
+                               clip_seconds: int, words, force: bool, voice_name: str, instruction: str = "") -> Optional[str]:
+    """Runs the full voice-over pipeline for one clip IF it's wanted — either
+    because the caller explicitly asked for it (force=True) or because the
+    clip has almost no spoken words in it (auto-detected as silent/music).
+    Mutates out_path in place on success. Returns the narration script text
+    on success, or None if voice-over wasn't attempted/wanted or failed —
+    callers should treat None as "no voice-over on this clip", never as an
+    error to surface to the user."""
+    if not (force or clip_word_count(words, start, end) < 3):
+        return None
+    if not ELEVENLABS_API_KEY:
+        if force:
+            print("Voiceover requested but ELEVENLABS_API_KEY is not set — skipping.")
+        return None
+
+    try:
+        frames = extract_sample_frames(source, start, end, job_dir)
+        script = generate_voiceover_script(frames, clip_seconds, instruction)
+        if not script:
+            return None
+        vo_audio = synthesize_voiceover(script, voice_name, job_dir)
+        if not vo_audio:
+            return None
+        muxed = out_path.with_suffix(".vo.mp4")
+        if mux_voiceover(out_path, vo_audio, muxed):
+            muxed.replace(out_path)
+            return script
+    except Exception as e:
+        print(f"Voiceover pipeline failed for {out_path.name}: {e}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 @app.post("/process")
 def process(req: ProcessRequest):
+    cleanup_old_jobs()
+
     job_id = str(uuid.uuid4())[:8]
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        source = download_video(req.url, job_dir)
+    except Exception as e:
+        raise HTTPException(400, f"Could not download video: {e}")
+
+    try:
+        duration = get_duration(source)
+    except Exception as e:
+        raise HTTPException(500, f"Downloaded video seems invalid: {e}")
+
+    try:
+        audio = extract_audio(source, job_dir)
+        words = transcribe(audio)
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {e}")
+
+    # Persist the transcript + duration so /reclip can regenerate a
+    # different moment from this same video later without re-downloading
+    # or re-transcribing (both slow, and repeat downloads are part of what
+    # triggers YouTube's rate limiting).
+    (job_dir / "words.json").write_text(json.dumps(words))
+    (job_dir / "meta.json").write_text(json.dumps({"duration": duration, "url": req.url}))
+
+    highlights = pick_highlights(words, req.clip_count, req.clip_seconds, duration, req.instruction)
+
+    if not highlights:
+        raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")
+
+    clips = []
+    for i, h in enumerate(highlights):
+        ass_path = job_dir / f"clip_{i}.ass"
+        words_to_ass(words, h["start"], h["end"], ass_path)
+
+        out_name = f"{job_id}_{i}.mp4"
+        out_path = OUTPUT_DIR / out_name
 
         try:
-            source = download_video(req.url, tmp)
+            cut_and_caption(source, h["start"], h["end"], ass_path, out_path)
         except Exception as e:
-            raise HTTPException(400, f"Could not download video: {e}")
+            raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
-        try:
-            duration = get_duration(source)
-        except Exception as e:
-            raise HTTPException(500, f"Downloaded video seems invalid: {e}")
+        voiceover_script = apply_voiceover_if_wanted(
+            source, job_dir, out_path, h["start"], h["end"], req.clip_seconds,
+            words, req.voiceover, req.voiceover_voice, req.instruction,
+        )
 
-        try:
-            audio = extract_audio(source, tmp)
-            words = transcribe(audio)
-        except Exception as e:
-            raise HTTPException(500, f"Transcription failed: {e}")
+        clips.append({
+            "file": out_name,
+            "start": h["start"],
+            "end": h["end"],
+            "reason": h.get("reason", ""),
+            "url": f"/clips/{out_name}",
+            "voiceover_script": voiceover_script,
+            "has_voiceover": voiceover_script is not None,
+        })
 
-        highlights = pick_highlights(words, req.clip_count, req.clip_seconds, duration, req.instruction)
+    return {"job_id": job_id, "clip_count": len(clips), "clips": clips}
 
-        if not highlights:
-            raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")
 
-        clips = []
-        for i, h in enumerate(highlights):
-            ass_path = tmp / f"clip_{i}.ass"
-            words_to_ass(words, h["start"], h["end"], ass_path)
+@app.post("/reclip")
+def reclip(req: ReclipRequest):
+    """Regenerates one clip from an already-processed video — either at an
+    explicit start time, or auto-picked to avoid the time ranges already
+    used (exclude_starts). Reuses the source video + transcript saved by
+    /process instead of re-downloading, both for speed and to avoid
+    hammering YouTube again for a video we already have locally."""
+    job_dir = JOBS_DIR / req.job_id
+    source = job_dir / "source.mp4"
+    words_path = job_dir / "words.json"
+    meta_path = job_dir / "meta.json"
+    if not (job_dir.exists() and source.exists() and words_path.exists() and meta_path.exists()):
+        raise HTTPException(404, "This session has expired — paste the link again to start a new one.")
 
-            out_name = f"{job_id}_{i}.mp4"
-            out_path = OUTPUT_DIR / out_name
+    words = json.loads(words_path.read_text())
+    meta = json.loads(meta_path.read_text())
+    duration = meta["duration"]
 
-            try:
-                cut_and_caption(source, h["start"], h["end"], ass_path, out_path)
-            except Exception as e:
-                raise HTTPException(500, f"Failed to render clip {i}: {e}")
+    if req.start is not None:
+        start = max(0.0, min(req.start, max(0.0, duration - req.clip_seconds)))
+        end = min(duration, start + req.clip_seconds)
+    else:
+        exclude_ranges = [(s, s + req.clip_seconds) for s in req.exclude_starts]
+        picks = pick_highlights(words, 1, req.clip_seconds, duration, req.instruction, exclude_ranges)
+        if not picks:
+            raise HTTPException(422, "Couldn't find another distinct moment in this video.")
+        start, end = picks[0]["start"], picks[0]["end"]
 
-            clips.append({
-                "file": out_name,
-                "start": h["start"],
-                "end": h["end"],
-                "reason": h.get("reason", ""),
-                "url": f"/clips/{out_name}",
-            })
+    ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
+    words_to_ass(words, start, end, ass_path)
 
-        return {"job_id": job_id, "clip_count": len(clips), "clips": clips}
+    out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
+    out_path = OUTPUT_DIR / out_name
+    try:
+        cut_and_caption(source, start, end, ass_path, out_path)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to render clip: {e}")
+
+    voiceover_script = apply_voiceover_if_wanted(
+        source, job_dir, out_path, start, end, req.clip_seconds,
+        words, req.voiceover, req.voiceover_voice, req.instruction,
+    )
+
+    return {
+        "file": out_name,
+        "start": start,
+        "end": end,
+        "url": f"/clips/{out_name}",
+        "voiceover_script": voiceover_script,
+        "has_voiceover": voiceover_script is not None,
+    }
+
+
+@app.post("/regenerate-voiceover")
+def regenerate_voiceover(req: RegenerateVoiceoverRequest):
+    """Re-synthesizes a clip's narration from user-edited script text,
+    without re-cutting or re-captioning the underlying clip — this is what
+    makes the voice-over feature "editable" rather than one-shot."""
+    job_dir = JOBS_DIR / req.job_id
+    clip_path = OUTPUT_DIR / req.clip_file
+    if not job_dir.exists():
+        raise HTTPException(404, "This session has expired — paste the link again to start a new one.")
+    if not clip_path.exists():
+        raise HTTPException(404, "That clip no longer exists on the server.")
+    if not req.script.strip():
+        raise HTTPException(400, "Script can't be empty.")
+
+    vo_audio = synthesize_voiceover(req.script, req.voice, job_dir)
+    if not vo_audio:
+        raise HTTPException(502, "Voice synthesis failed — check that ELEVENLABS_API_KEY is set correctly.")
+
+    muxed = clip_path.with_suffix(".vo.mp4")
+    if not mux_voiceover(clip_path, vo_audio, muxed):
+        raise HTTPException(500, "Failed to combine the new narration with the clip.")
+    muxed.replace(clip_path)
+
+    return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "voiceover_script": req.script, "has_voiceover": True}
+
+
+@app.get("/voices")
+def list_voices():
+    return {"voices": list(ELEVENLABS_VOICES.keys()), "default": DEFAULT_VOICE}
 
 
 @app.get("/health")
@@ -527,4 +912,6 @@ def health():
         "status": "ok",
         "transcription": "deepgram" if DEEPGRAM_API_KEY else "not configured",
         "highlight_picking": "claude" if ANTHROPIC_API_KEY else "heuristic fallback",
+        "youtube_cookies": "configured" if YTDLP_COOKIES else "not set (may hit YouTube bot checks)",
+        "voiceover": "elevenlabs" if ELEVENLABS_API_KEY else "not configured",
     }

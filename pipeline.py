@@ -414,14 +414,48 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
         return None
 
 
+def _even_spaced_highlights(clip_count: int, clip_seconds: int, total_duration: float, exclude_ranges=None):
+    """Spaces clip_count windows evenly across the video instead of
+    scoring by word density — used when there's no transcript to score at
+    all (silent or music-only source). This is exactly the case the
+    voice-over feature exists for, so highlight picking must not hard-fail
+    just because nobody's talking; it should still hand back clip windows
+    for apply_voiceover_if_wanted() to narrate afterward."""
+    exclude_ranges = exclude_ranges or []
+    if total_duration <= 0:
+        return []
+    if total_duration <= clip_seconds:
+        return [{"start": 0.0, "end": total_duration, "score": 0}]
+
+    max_start = total_duration - clip_seconds
+    if clip_count <= 1:
+        starts = [0.0]
+    else:
+        step = max_start / (clip_count - 1)
+        starts = [min(max_start, i * step) for i in range(clip_count)]
+
+    highlights = []
+    for s in starts:
+        e = min(total_duration, s + clip_seconds)
+        if any(not (e <= ex[0] or s >= ex[1]) for ex in exclude_ranges):
+            continue
+        highlights.append({"start": s, "end": e, "score": 0})
+    return highlights
+
+
 def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_duration: float, exclude_ranges=None):
     """Speech-density fallback: scores fixed-length windows by how many
     words land in them and returns the top non-overlapping windows. Used
     when no ANTHROPIC_API_KEY is set, or if the LLM call fails for any
     reason — clip generation should never hard-fail just because the
-    smarter picker had a bad day."""
+    smarter picker had a bad day.
+
+    If there's no transcript at all (silent/music-only video), there's
+    nothing to score by density — fall back to evenly-spaced windows
+    instead of returning nothing, so silent videos can still get clips
+    (with voice-over auto-applied to them downstream)."""
     if not words:
-        return []
+        return _even_spaced_highlights(clip_count, clip_seconds, total_duration, exclude_ranges)
 
     exclude_ranges = exclude_ranges or []
     stride = max(5, clip_seconds // 3)
@@ -442,6 +476,12 @@ def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_d
         overlaps_excluded = any(not (c["end"] <= ex[0] or c["start"] >= ex[1]) for ex in exclude_ranges)
         if not overlaps_chosen and not overlaps_excluded:
             chosen.append(c)
+
+    # Very short or sparsely-worded videos can still come up empty even
+    # with words present (e.g. a 10s clip request against a 12s video with
+    # one word in it) — fall back to even spacing rather than failing.
+    if not chosen:
+        return _even_spaced_highlights(clip_count, clip_seconds, total_duration, exclude_ranges)
 
     chosen.sort(key=lambda c: c["start"])
     return chosen

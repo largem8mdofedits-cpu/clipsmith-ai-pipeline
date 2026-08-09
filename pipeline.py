@@ -311,11 +311,13 @@ def _ass_timestamp(t: float) -> str:
 
 
 def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chunk_size: int = 5):
-    """Writes an .ass subtitle file scoped to one clip's time range, using
-    ASS karaoke tags (\\k) so each word switches from the base colour to
-    the highlight colour exactly when it's spoken — libass (which
-    ffmpeg's `ass` filter uses to render) handles the per-word timing
-    itself, no frame-by-frame image generation needed.
+    """Writes an .ass subtitle file scoped to one clip's time range: words
+    highlight from white to yellow exactly as they're spoken (ASS karaoke
+    \\k tags), AND each word pops with a quick scale bounce the instant
+    it becomes active (ASS \\t transforms) — the combination is what gives
+    auto-captions from tools like Submagic/Opus their punchy feel, rather
+    than a flat color change. libass (built into ffmpeg) renders all of
+    this directly from the tags below — no frame-by-frame image generation.
 
     PlayResX/Y match the 1080x1920 output frame so font sizes and margins
     line up correctly after the crop+scale filter runs.
@@ -325,6 +327,9 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
     # PrimaryColour = the "already spoken" / highlighted colour (bright
     # yellow). SecondaryColour = the "not yet spoken" colour (white) that
     # \k tags start in before their timer elapses. Colours are &HAABBGGRR.
+    # Outline/Shadow are pushed up from the original pass for a bolder,
+    # more legible look at small preview sizes (matches what most
+    # short-form caption tools default to).
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -336,14 +341,16 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Karaoke,Liberation Sans Bold,72,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,"
-        "1,0,0,0,100,100,0,0,1,4,0,2,60,60,180,1\n\n"
+        "Style: Karaoke,Liberation Sans Bold,80,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        "1,0,0,0,100,100,0,0,1,5,2,2,60,60,190,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
     # group into on-screen lines of `chunk_size` words each
     chunks = [clip_words[i:i + chunk_size] for i in range(0, len(clip_words), chunk_size)]
+
+    POP_MS = 90  # how long the scale-up half of each word's pop takes
 
     lines = [header]
     for chunk in chunks:
@@ -358,7 +365,20 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
             word = w["word"].strip()
             if not word:
                 continue
-            karaoke_text += f"{{\\k{dur_cs}}}{word} "
+            # Offset of this word's own start, in ms, relative to the
+            # Dialogue line's start — \t's time args are line-relative,
+            # which is what lets each word in the group pop at its own
+            # moment instead of all together.
+            word_offset_ms = max(0, int(round((w["start"] - clip_start - line_start) * 1000)))
+            pop_start = word_offset_ms
+            pop_mid = word_offset_ms + POP_MS
+            pop_end = word_offset_ms + POP_MS * 2
+            karaoke_text += (
+                f"{{\\k{dur_cs}"
+                f"\\t({pop_start},{pop_mid},\\fscx122\\fscy122)"
+                f"\\t({pop_mid},{pop_end},\\fscx100\\fscy100)}}"
+                f"{word} "
+            )
 
         if not karaoke_text.strip():
             continue

@@ -1258,6 +1258,11 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
         "clips": clips,
         "source_bytes": source.stat().st_size if source.exists() else 0,
         "is_youtube": source_url not in ("", "uploaded file"),
+        # Lets the backend enforce each plan's monthly "minutes of source
+        # video" cap (see PLAN_MONTHLY_MINUTES in server.js) — this is the
+        # length of the source video that was downloaded/uploaded and
+        # transcribed, not the length of the rendered clips.
+        "source_minutes": round(duration / 60, 2),
     }
 
 

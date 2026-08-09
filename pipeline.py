@@ -84,7 +84,14 @@ def download_video(url: str, dest: Path) -> Path:
     out_path = dest / "source.mp4"
     result = subprocess.run(
         ["yt-dlp",
-         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+         # Capped at 1080p: the final output is always cropped/scaled to
+         # 1080x1920 anyway, so pulling a 4K (or higher) source just wastes
+         # bandwidth and — more importantly — makes the later ffmpeg decode
+         # step dramatically more memory-hungry. On a resource-limited
+         # Railway container, decoding a 4K AV1 source was silently
+         # OOM-killing the ffmpeg render step with no error message at all
+         # (process just died right after starting, 0 frames encoded).
+         "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[height<=1080]/best",
          "--merge-output-format", "mp4",
          "--no-playlist",
          "--remote-components", "ejs:github",
@@ -252,6 +259,12 @@ def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duratio
             },
             timeout=60,
         )
+        if resp.status_code >= 400:
+            # Log the response body — Anthropic's error responses explain
+            # exactly what's wrong (bad model name, bad request shape,
+            # etc), which raise_for_status()'s exception message alone
+            # doesn't include.
+            print(f"Anthropic API error {resp.status_code}: {resp.text[:1000]}")
         resp.raise_for_status()
         text = resp.json()["content"][0]["text"]
 
@@ -429,9 +442,17 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         "scale=1080:1920,"
         f"ass='{ass_name}'"
     )
+    # -threads 2: without this, libx264 auto-detects the host's full core
+    # count (60+ on some Railway hosts) and allocates per-thread buffers
+    # accordingly, which was spiking memory usage enough to get the process
+    # OOM-killed silently (no ffmpeg error text at all, just a nonzero exit
+    # with 0 frames encoded). Capping threads keeps memory use predictable
+    # on a resource-limited container.
+    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source.resolve()), "-t", str(duration),
+           "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+           "-c:a", "aac", str(out_path.resolve())]
     result = subprocess.run(
-        ["ffmpeg", "-y", "-ss", str(start), "-i", str(source.resolve()), "-t", str(duration),
-         "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(out_path.resolve())],
+        cmd,
         capture_output=True, text=True,
         cwd=str(ass_dir),  # <-- this is what makes the bare filename resolve correctly
     )
@@ -440,9 +461,10 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         # stdout/stderr) since the exception message shown to the client is
         # truncated — the real cause is often earlier in ffmpeg's output
         # than what fits in that truncated tail.
-        print(f"ffmpeg command: {' '.join(['ffmpeg','-y','-ss',str(start),'-i',str(source.resolve()),'-t',str(duration),'-vf',vf,'-c:v','libx264','-preset','veryfast','-c:a','aac',str(out_path.resolve())])}")
+        print(f"ffmpeg command: {' '.join(cmd)}")
+        print(f"ffmpeg exit code: {result.returncode}")
         print(f"ffmpeg full stderr:\n{result.stderr}")
-        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2500:]}")
+        raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {result.stderr[-2500:]}")
 
 
 # ---------------------------------------------------------------------------

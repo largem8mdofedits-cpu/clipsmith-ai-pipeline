@@ -10,6 +10,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-liberation \
+    fonts-dejavu-core \
     curl \
     unzip \
     ca-certificates \

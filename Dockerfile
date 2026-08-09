@@ -26,6 +26,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Re-pull the newest yt-dlp release on every build. requirements.txt pins
+# no version, but Docker still caches the `pip install -r requirements.txt`
+# layer above whenever requirements.txt itself hasn't changed — so without
+# this, a rebuild can silently keep running a yt-dlp that's days or weeks
+# stale. YouTube tweaks its anti-bot checks often enough that this alone
+# was a real cause of "Sign in to confirm you're not a bot" failures.
+# Placed after COPY . . so it reruns on every code change (this project's
+# pipeline.py changes often, which conveniently busts the cache here too).
+RUN pip install --no-cache-dir -U yt-dlp
+
 # Railway sets $PORT at runtime; default to 8000 for local `docker run`.
 ENV PORT=8000
 EXPOSE 8000

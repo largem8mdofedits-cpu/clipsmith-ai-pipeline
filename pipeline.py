@@ -104,6 +104,49 @@ DEFAULT_VOICE = "Rachel"
 # chain stages before the caption burn-in.
 COLOR_PRESETS = ["none", "warm", "moody", "vibrant", "bw", "cinematic"]
 
+# Caption text-style presets — each controls font, size, color, outline
+# weight, per-word chunk size, and whether the pop-bounce/karaoke-color
+# animation is used at all. Colours are ASS's &HAABBGGRR order.
+CAPTION_STYLES = {
+    "bold": dict(font="Liberation Sans Bold", size=80, primary="&H0000FFFF", secondary="&H00FFFFFF",
+                 outline=5, shadow=2, bold=1, pop=True, karaoke=True, fade=False, chunk_size=4),
+    "karaoke": dict(font="Liberation Sans Bold", size=74, primary="&H00FFFF00", secondary="&H00FFFFFF",
+                     outline=4, shadow=1, bold=1, pop=False, karaoke=True, fade=False, chunk_size=5),
+    "meme": dict(font="DejaVu Sans", size=88, primary="&H00FFFFFF", secondary="&H00FFFFFF",
+                 outline=7, shadow=0, bold=1, pop=False, karaoke=False, fade=False, chunk_size=3),
+    "minimal": dict(font="Liberation Sans", size=58, primary="&H00FFFFFF", secondary="&H00DDDDDD",
+                     outline=2, shadow=0, bold=0, pop=False, karaoke=False, fade=True, chunk_size=6),
+}
+DEFAULT_CAPTION_STYLE = "bold"
+
+# Voice-over tone presets — steer generate_voiceover_script()'s prompt
+# rather than changing the TTS voice actor (that's the separate `voice`
+# param). "ugc_ad" specifically asks Claude to read any on-screen text it
+# can see in the sampled frames out loud (it's already looking at the
+# frames for context, so this just tells it to use that ability) and close
+# with a punchy confirmation line, matching a typical UGC ad format.
+VOICEOVER_STYLES = {
+    "narration": "a natural, documentary-style narrator describing what's happening on screen",
+    "ugc_ad": (
+        "a casual, enthusiastic UGC/creator-style advertisement voice — first-person, "
+        "like a real person showing off a product to camera. If any on-screen text, "
+        "captions, callouts, or prompts are visible in the frames, read them out loud "
+        "naturally as part of the pitch instead of ignoring them. Close the script with "
+        "a short, punchy confirmation line like \"and yeah, it definitely works\" or "
+        "similar in spirit"
+    ),
+    "hype": "a high-energy hype voice — short punchy sentences, built for a viral moment",
+    "calm": "a calm, relaxed, slow-paced voice",
+}
+DEFAULT_VOICEOVER_STYLE = "narration"
+
+# Synthesized (not licensed/downloaded) sound effects — generated once via
+# ffmpeg's lavfi audio sources and cached to disk, so there's no external
+# provider, API key, or copyright question involved.
+SOUND_EFFECTS = ["none", "ting", "pop", "whoosh", "click"]
+SFX_DIR = Path(__file__).parent / "sfx"
+SFX_DIR.mkdir(exist_ok=True)
+
 
 class ProcessRequest(BaseModel):
     url: str
@@ -113,8 +156,15 @@ class ProcessRequest(BaseModel):
                             # e.g. "focus on the part where they argue about money"
     voiceover: bool = False           # force AI voice-over even if the clip has speech
     voiceover_voice: str = DEFAULT_VOICE
+    voiceover_style: str = DEFAULT_VOICEOVER_STYLE  # one of VOICEOVER_STYLES
     zoom_pan: bool = False             # subtle continuous Ken Burns-style zoom-in
     color_preset: str = "none"         # one of COLOR_PRESETS
+    caption_style: str = DEFAULT_CAPTION_STYLE  # one of CAPTION_STYLES
+    sfx: str = "none"                  # one of SOUND_EFFECTS, one-shot
+    sfx_position: str = "end"          # "start" or "end"
+    typing_sound: bool = False         # ambient typing-click bed under the whole clip
+    bg_music_url: str = ""             # YouTube/YouTube Music link, mixed in at low volume
+    flash_intro: bool = False          # white flash-in + shutter click instead of a plain fade
 
 
 class ReclipRequest(BaseModel):
@@ -125,8 +175,15 @@ class ReclipRequest(BaseModel):
     exclude_starts: List[float] = []  # start times already used, so auto-pick doesn't repeat them
     voiceover: bool = False
     voiceover_voice: str = DEFAULT_VOICE
+    voiceover_style: str = DEFAULT_VOICEOVER_STYLE
     zoom_pan: bool = False
     color_preset: str = "none"
+    caption_style: str = DEFAULT_CAPTION_STYLE
+    sfx: str = "none"
+    sfx_position: str = "end"
+    typing_sound: bool = False
+    bg_music_url: str = ""
+    flash_intro: bool = False
 
 
 class RegenerateVoiceoverRequest(BaseModel):
@@ -509,26 +566,35 @@ def _ass_timestamp(t: float) -> str:
     return f"{h:d}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chunk_size: int = 4):
-    """Writes an .ass subtitle file scoped to one clip's time range: words
-    highlight from white to yellow exactly as they're spoken (ASS karaoke
-    \\k tags), AND each word pops with a quick scale bounce the instant
-    it becomes active (ASS \\t transforms) — the combination is what gives
-    auto-captions from tools like Submagic/Opus their punchy feel, rather
-    than a flat color change. libass (built into ffmpeg) renders all of
-    this directly from the tags below — no frame-by-frame image generation.
+def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
+                  chunk_size: Optional[int] = None, caption_style: str = DEFAULT_CAPTION_STYLE):
+    """Writes an .ass subtitle file scoped to one clip's time range. Text
+    color, font, outline weight, per-line word count, and which animation
+    (if any) is used are all driven by `caption_style` (see CAPTION_STYLES)
+    — this is what makes the frontend's Bold Pop / Karaoke / Meme Stack /
+    Minimal picker actually change the real burned-in captions, not just
+    the demo preview.
+
+    - "karaoke" styles use ASS \\k tags so words highlight from
+      SecondaryColour to PrimaryColour exactly as they're spoken.
+    - "pop" styles additionally bounce each word's scale via \\t
+      transforms the instant it becomes active.
+    - Styles with neither just render each line's full text statically —
+      still perfectly readable, just no animation (e.g. Meme Stack, which
+      traditionally isn't karaoke-highlighted at all).
+    - "fade" styles (Minimal) fade each line in/out instead of a hard cut.
 
     PlayResX/Y match the 1080x1920 output frame so font sizes and margins
     line up correctly after the crop+scale filter runs.
     """
+    style = CAPTION_STYLES.get(caption_style, CAPTION_STYLES[DEFAULT_CAPTION_STYLE])
+    if chunk_size is None:
+        chunk_size = style["chunk_size"]
+
     clip_words = [w for w in words if clip_start <= w["start"] < clip_end]
 
-    # PrimaryColour = the "already spoken" / highlighted colour (bright
-    # yellow). SecondaryColour = the "not yet spoken" colour (white) that
-    # \k tags start in before their timer elapses. Colours are &HAABBGGRR.
-    # Outline/Shadow are pushed up from the original pass for a bolder,
-    # more legible look at small preview sizes (matches what most
-    # short-form caption tools default to).
+    # Colours are &HAABBGGRR. Outline/Shadow/Bold/Fontname/Fontsize all
+    # come from the selected style so each preset actually looks distinct.
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -541,16 +607,17 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
         # momentarily overflow, get auto-wrapped onto two rows, then snap
         # back to one row the instant the pop finished. That's the visible
         # "scales and goes back to normal" glitch. WrapStyle 2 fixes it by
-        # never re-wrapping — combined with the smaller pop below and
-        # smaller word-group size, lines stay comfortably within frame.
+        # never re-wrapping — combined with a small pop and modest
+        # word-group sizes, lines stay comfortably within frame.
         "WrapStyle: 2\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Karaoke,Liberation Sans Bold,80,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,"
-        "1,0,0,0,100,100,0,0,1,5,2,2,60,60,190,1\n\n"
+        f"Style: Karaoke,{style['font']},{style['size']},{style['primary']},{style['secondary']},"
+        f"&H00000000,&H00000000,{style['bold']},0,0,0,100,100,0,0,1,{style['outline']},"
+        f"{style['shadow']},2,60,60,190,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -558,9 +625,10 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
     # group into on-screen lines of `chunk_size` words each
     chunks = [clip_words[i:i + chunk_size] for i in range(0, len(clip_words), chunk_size)]
 
-    POP_MS = 90    # how long the scale-up half of each word's pop takes
-    POP_SCALE = 110  # was 122 — smaller bump leaves more margin before a line
-                     # could ever overflow its row, on top of the WrapStyle fix above
+    POP_MS = 90      # how long the scale-up half of each word's pop takes
+    POP_SCALE = 110  # smaller bump leaves margin before a line could ever
+                      # overflow its row, on top of the WrapStyle fix above
+    FADE_MS = 150    # in/out fade duration for "fade"-style presets
 
     lines = [header]
     for chunk in chunks:
@@ -568,6 +636,19 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
             continue
         line_start = chunk[0]["start"] - clip_start
         line_end = chunk[-1]["end"] - clip_start
+
+        if not style["karaoke"]:
+            # Static (or fade-only) presets: no per-word \k timing needed,
+            # just render the whole line's text as one plain string.
+            text = " ".join(w["word"].strip() for w in chunk if w["word"].strip())
+            if not text:
+                continue
+            prefix = f"{{\\fad({FADE_MS},{FADE_MS})}}" if style["fade"] else ""
+            lines.append(
+                f"Dialogue: 0,{_ass_timestamp(line_start)},{_ass_timestamp(line_end)},"
+                f"Karaoke,,0,0,0,,{prefix}{text}\n"
+            )
+            continue
 
         karaoke_text = ""
         for w in chunk:
@@ -580,15 +661,18 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
             # which is what lets each word in the group pop at its own
             # moment instead of all together.
             word_offset_ms = max(0, int(round((w["start"] - clip_start - line_start) * 1000)))
-            pop_start = word_offset_ms
-            pop_mid = word_offset_ms + POP_MS
-            pop_end = word_offset_ms + POP_MS * 2
-            karaoke_text += (
-                f"{{\\k{dur_cs}"
-                f"\\t({pop_start},{pop_mid},\\fscx{POP_SCALE}\\fscy{POP_SCALE})"
-                f"\\t({pop_mid},{pop_end},\\fscx100\\fscy100)}}"
-                f"{word} "
-            )
+            if style["pop"]:
+                pop_start = word_offset_ms
+                pop_mid = word_offset_ms + POP_MS
+                pop_end = word_offset_ms + POP_MS * 2
+                karaoke_text += (
+                    f"{{\\k{dur_cs}"
+                    f"\\t({pop_start},{pop_mid},\\fscx{POP_SCALE}\\fscy{POP_SCALE})"
+                    f"\\t({pop_mid},{pop_end},\\fscx100\\fscy100)}}"
+                    f"{word} "
+                )
+            else:
+                karaoke_text += f"{{\\k{dur_cs}}}{word} "
 
         if not karaoke_text.strip():
             continue
@@ -636,12 +720,17 @@ def _color_grade_filter(preset: str) -> str:
 
 
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
-                     zoom_pan: bool = False, color_preset: str = "none"):
+                     zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
-    and/or a color grading preset, and burns in the animated karaoke
-    captions — all via ffmpeg. Captions are always the LAST filter stage so
-    they stay crisp on top of any zoom/color grading rather than getting
-    color-graded or zoomed themselves.
+    and/or a color grading preset, burns in the animated karaoke captions,
+    and adds a short automatic fade-in/fade-out on every clip — all via
+    ffmpeg. Captions are always the LAST video filter stage so they stay
+    crisp on top of any zoom/color grading rather than getting graded or
+    zoomed themselves.
+
+    `flash_intro` swaps the fade-in from black to white, giving a quick
+    camera-flash feel instead of a plain fade — paired with a synthesized
+    shutter "click" mixed into the audio afterward by apply_audio_extras().
 
     The ass/subtitles filters' path handling is notoriously fragile on
     Windows: ffmpeg's filtergraph mini-language uses ':' to separate
@@ -656,6 +745,11 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     ass_dir = ass_path.parent.resolve()
     ass_name = ass_path.name  # bare filename — no separators, nothing to escape
 
+    # Fade duration is capped relative to clip length so a very short clip
+    # never has its fade-in and fade-out overlap.
+    fade_d = max(0.0, min(0.3, duration / 6))
+    fade_color = "white" if flash_intro else "black"
+
     vf_stages = [
         "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'",
         "scale=1080:1920",
@@ -667,7 +761,17 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         if cg:
             vf_stages.append(cg)
     vf_stages.append(f"ass='{ass_name}'")
+    if fade_d > 0:
+        vf_stages.append(f"fade=t=in:st=0:d={fade_d}:color={fade_color}")
+        vf_stages.append(f"fade=t=out:st={max(0.0, duration - fade_d)}:d={fade_d}")
     vf = ",".join(vf_stages)
+
+    af_stages = []
+    if fade_d > 0:
+        af_stages.append(f"afade=t=in:st=0:d={fade_d}")
+        af_stages.append(f"afade=t=out:st={max(0.0, duration - fade_d)}:d={fade_d}")
+    af = ",".join(af_stages)
+
     # -threads 2: without this, libx264 auto-detects the host's full core
     # count (60+ on some Railway hosts) and allocates per-thread buffers
     # accordingly, which was spiking memory usage enough to get the process
@@ -675,8 +779,11 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # with 0 frames encoded). Capping threads keeps memory use predictable
     # on a resource-limited container.
     cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source.resolve()), "-t", str(duration),
-           "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
-           "-c:a", "aac", str(out_path.resolve())]
+           "-vf", vf]
+    if af:
+        cmd += ["-af", af]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-c:a", "aac", str(out_path.resolve())]
     result = subprocess.run(
         cmd,
         capture_output=True, text=True,
@@ -719,16 +826,22 @@ def extract_sample_frames(source: Path, start: float, end: float, dest: Path, n:
     return frames
 
 
-def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instruction: str = "") -> str:
+def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instruction: str = "",
+                               style: str = DEFAULT_VOICEOVER_STYLE) -> str:
     """Asks Claude to look at sampled frames and write a short narration
-    script sized to fit the clip's duration. Returns "" (never raises) on
-    any failure so a bad script never blocks the rest of clip generation —
-    the caller just skips voice-over for that clip."""
+    script sized to fit the clip's duration, in the tone described by
+    `style` (see VOICEOVER_STYLES) — this is what lets the frontend's
+    Narration / UGC Ad / Hype / Calm picker actually change how the script
+    is written, including UGC Ad mode reading any on-screen text visible
+    in the frames out loud and closing with a tagline. Returns "" (never
+    raises) on any failure so a bad script never blocks the rest of clip
+    generation — the caller just skips voice-over for that clip."""
     if not ANTHROPIC_API_KEY or not frame_paths:
         return ""
 
     words_budget = max(8, int(clip_seconds * 2.5))  # ~2.5 spoken words/sec is a natural narration pace
     steer = f' The creator specifically asked for: "{instruction}".' if instruction else ""
+    style_desc = VOICEOVER_STYLES.get(style, VOICEOVER_STYLES[DEFAULT_VOICEOVER_STYLE])
 
     content = []
     for fp in frame_paths:
@@ -743,9 +856,9 @@ def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instru
         "type": "text",
         "text": (
             f"These are frames sampled evenly across a {clip_seconds}-second video clip that has "
-            f"no spoken dialogue (music-only or silent). Write a short, punchy voice-over narration "
-            f"script for it, the kind that works over a TikTok/Reels/Shorts clip. Aim for about "
-            f"{words_budget} words so it fits {clip_seconds} seconds read at a natural pace."
+            f"no spoken dialogue (music-only or silent). Write a short voice-over narration script "
+            f"for it, written in the voice of {style_desc}. Aim for about {words_budget} words so it "
+            f"fits {clip_seconds} seconds read at a natural pace."
             f"{steer} Respond with ONLY the narration text — no quotes, no stage directions, no "
             f"timestamps."
         ),
@@ -831,7 +944,8 @@ def mux_voiceover(clip_path: Path, voiceover_path: Path, out_path: Path) -> bool
 
 
 def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start: float, end: float,
-                               clip_seconds: int, words, force: bool, voice_name: str, instruction: str = "") -> Optional[str]:
+                               clip_seconds: int, words, force: bool, voice_name: str, instruction: str = "",
+                               voiceover_style: str = DEFAULT_VOICEOVER_STYLE) -> Optional[str]:
     """Runs the full voice-over pipeline for one clip IF it's wanted — either
     because the caller explicitly asked for it (force=True) or because the
     clip has almost no spoken words in it (auto-detected as silent/music).
@@ -848,7 +962,7 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
 
     try:
         frames = extract_sample_frames(source, start, end, job_dir)
-        script = generate_voiceover_script(frames, clip_seconds, instruction)
+        script = generate_voiceover_script(frames, clip_seconds, instruction, voiceover_style)
         if not script:
             return None
         vo_audio = synthesize_voiceover(script, voice_name, job_dir)
@@ -864,14 +978,184 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
 
 
 # ---------------------------------------------------------------------------
+# Sound effects, typing-click ambience, and YouTube-link background music —
+# all layered onto the clip's existing audio (original speech or AI
+# narration, whichever came out of the steps above) as a final mix pass.
+# ---------------------------------------------------------------------------
+def _ensure_sfx(name: str) -> Optional[Path]:
+    """Synthesizes (once, then caches to disk) a short sound effect purely
+    via ffmpeg's lavfi audio sources — no external provider, download, or
+    licensing question involved, since nothing is downloaded or sampled
+    from anywhere. Returns None for "none"/unknown names or on synth
+    failure (caller treats that as "skip the effect", never an error)."""
+    if not name or name == "none" or name not in SOUND_EFFECTS:
+        return None
+    path = SFX_DIR / f"{name}.wav"
+    if path.exists():
+        return path
+    filters = {
+        "ting": "sine=frequency=1400:duration=0.35,afade=t=out:st=0.05:d=0.3,volume=0.9",
+        "pop": "anoisesrc=d=0.12:c=pink:a=0.9,bandpass=f=300:width_type=h:w=200,afade=t=out:st=0:d=0.12,volume=1.4",
+        "whoosh": "anoisesrc=d=0.4:c=white:a=0.6,bandpass=f=1500:width_type=h:w=1800,"
+                  "afade=t=in:st=0:d=0.08,afade=t=out:st=0.2:d=0.2,volume=0.8",
+        "click": "sine=frequency=2800:duration=0.035,afade=t=out:st=0:d=0.03,volume=0.5",
+    }
+    filt = filters.get(name)
+    if not filt:
+        return None
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", filt, "-ar", "44100", str(path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not path.exists():
+            print(f"SFX synth failed for {name}: {result.stderr[-400:]}")
+            return None
+        return path
+    except Exception as e:
+        print(f"SFX synth error for {name}: {e}")
+        return None
+
+
+def _ensure_typing_loop() -> Optional[Path]:
+    """A single click padded out to ~180ms of silence, meant to be played
+    back-to-back via -stream_loop to build a steady typing-keyboard
+    texture without needing per-word timing precision."""
+    path = SFX_DIR / "typing_loop.wav"
+    if path.exists():
+        return path
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i",
+             "sine=frequency=2800:duration=0.035,afade=t=out:st=0:d=0.03,volume=0.5,apad=pad_dur=0.15",
+             "-ar", "44100", str(path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not path.exists():
+            print(f"Typing-loop synth failed: {result.stderr[-400:]}")
+            return None
+        return path
+    except Exception as e:
+        print(f"Typing-loop synth error: {e}")
+        return None
+
+
+def download_bg_music(url: str, dest: Path) -> Optional[Path]:
+    """Downloads just the audio from a YouTube/YouTube Music link to use as
+    background music. Reuses the same player-client fallback + optional
+    cookies approach as download_video() since these are still youtube.com
+    requests subject to the same bot-detection. Returns None (never
+    raises) on failure — background music is always an enhancement, never
+    a requirement for a clip to render."""
+    out_template = str(dest / "bgmusic.%(ext)s")
+    cookies_path = None
+    if YTDLP_COOKIES:
+        cookies_path = dest / "cookies_music.txt"
+        cookies_path.write_text(YTDLP_COOKIES, encoding="utf-8")
+
+    for client in ["android", "ios", "tv", "mweb", "web_creator", "web"]:
+        args = [
+            "yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "m4a",
+            "--no-playlist", "--extractor-args", f"youtube:player_client={client}",
+        ]
+        if cookies_path:
+            args += ["--cookies", str(cookies_path)]
+        args += ["-o", out_template, url]
+        result = subprocess.run(args, capture_output=True, text=True)
+        candidate = dest / "bgmusic.m4a"
+        if result.returncode == 0 and candidate.exists():
+            return candidate
+        print(f"bg-music download attempt with player_client={client} failed:\n{result.stderr[-600:]}")
+    return None
+
+
+def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: str, sfx_position: str,
+                        typing_sound: bool, bg_music_path: Optional[Path]) -> bool:
+    """Layers an optional one-shot sound effect, an ambient typing-click
+    bed, and/or background music UNDER the clip's current audio track
+    (whatever cut_and_caption/apply_voiceover_if_wanted left it with).
+    Returns True and writes out_path if anything was actually mixed in;
+    False (no-op, caller keeps the original file) if nothing was
+    requested or the mix failed — same degrade-gracefully pattern as the
+    rest of this pipeline."""
+    input_args = ["-i", str(clip_path.resolve())]
+    filter_parts = ["[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0]"]
+    mix_labels = ["[a0]"]
+    idx = 1
+
+    if sfx and sfx != "none":
+        sfx_path = _ensure_sfx(sfx)
+        if sfx_path:
+            input_args += ["-i", str(sfx_path.resolve())]
+            delay_ms = 0 if sfx_position == "start" else max(0, int((duration - 0.4) * 1000))
+            filter_parts.append(
+                f"[{idx}:a]adelay=delays={delay_ms}:all=1,"
+                f"aformat=sample_rates=44100:channel_layouts=stereo[a{idx}]"
+            )
+            mix_labels.append(f"[a{idx}]")
+            idx += 1
+
+    if typing_sound:
+        loop_path = _ensure_typing_loop()
+        if loop_path:
+            input_args += ["-stream_loop", "-1", "-i", str(loop_path.resolve())]
+            filter_parts.append(
+                f"[{idx}:a]atrim=0:{duration},aformat=sample_rates=44100:channel_layouts=stereo,volume=0.35[a{idx}]"
+            )
+            mix_labels.append(f"[a{idx}]")
+            idx += 1
+
+    if bg_music_path and bg_music_path.exists():
+        input_args += ["-stream_loop", "-1", "-i", str(bg_music_path.resolve())]
+        filter_parts.append(
+            f"[{idx}:a]atrim=0:{duration},aformat=sample_rates=44100:channel_layouts=stereo,volume=0.16[a{idx}]"
+        )
+        mix_labels.append(f"[a{idx}]")
+        idx += 1
+
+    if idx == 1:
+        return False  # nothing requested (or everything failed to prepare)
+
+    filter_parts.append(
+        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0[aout]"
+    )
+    filter_complex = ";".join(filter_parts)
+
+    cmd = ["ffmpeg", "-y"] + input_args + [
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        str(out_path.resolve()),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Audio extras mix failed: {result.stderr[-1500:]}")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
+def _default_opts() -> dict:
+    """Default clip-rendering options — used as a base that callers
+    override, so any new option added later only needs a default here
+    instead of touching every call site."""
+    return dict(
+        voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
+        zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
+        sfx="none", sfx_position="end", typing_sound=False, bg_music_url="", flash_intro=False,
+    )
+
+
 def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, clip_seconds: int,
-                     instruction: str, voiceover: bool, voiceover_voice: str,
-                     zoom_pan: bool, color_preset: str, source_url: str = "") -> dict:
+                     instruction: str, opts: dict, source_url: str = "") -> dict:
     """Shared pipeline body for both /process (download-from-URL) and
     /process-upload (user's own file) — everything after "we have a
-    source.mp4 on disk" is identical between the two entry points."""
+    source.mp4 on disk" is identical between the two entry points.
+    `opts` holds every clip-rendering option (voiceover, zoom/color,
+    caption style, sfx, background music, etc) so this signature doesn't
+    grow a new positional parameter every time a feature is added."""
     try:
         duration = get_duration(source)
     except Exception as e:
@@ -895,24 +1179,42 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
     if not highlights:
         raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")
 
+    # Background music is downloaded once per /process call (not once per
+    # clip) since every clip in the batch shares the same music track.
+    bg_music_path = None
+    if opts.get("bg_music_url"):
+        bg_music_path = download_bg_music(opts["bg_music_url"], job_dir)
+        if not bg_music_path:
+            print(f"Background music download failed for {opts['bg_music_url']!r} — continuing without it.")
+
     clips = []
     for i, h in enumerate(highlights):
         ass_path = job_dir / f"clip_{i}.ass"
-        words_to_ass(words, h["start"], h["end"], ass_path)
+        words_to_ass(words, h["start"], h["end"], ass_path, caption_style=opts["caption_style"])
 
         out_name = f"{job_id}_{i}.mp4"
         out_path = OUTPUT_DIR / out_name
 
         try:
             cut_and_caption(source, h["start"], h["end"], ass_path, out_path,
-                             zoom_pan=zoom_pan, color_preset=color_preset)
+                             zoom_pan=opts["zoom_pan"], color_preset=opts["color_preset"],
+                             flash_intro=opts["flash_intro"])
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
         voiceover_script = apply_voiceover_if_wanted(
             source, job_dir, out_path, h["start"], h["end"], clip_seconds,
-            words, voiceover, voiceover_voice, instruction,
+            words, opts["voiceover"], opts["voiceover_voice"], instruction, opts["voiceover_style"],
         )
+
+        # Sound effects / typing / background music layer onto whatever
+        # audio track is currently on out_path (original speech or the
+        # narration voiceover just muxed in above).
+        clip_duration = h["end"] - h["start"]
+        mixed_path = out_path.with_suffix(".mix.mp4")
+        if apply_audio_extras(out_path, mixed_path, clip_duration, opts["sfx"], opts["sfx_position"],
+                               opts["typing_sound"], bg_music_path):
+            mixed_path.replace(out_path)
 
         clips.append({
             "file": out_name,
@@ -940,10 +1242,14 @@ def process(req: ProcessRequest):
     except Exception as e:
         raise HTTPException(400, f"Could not download video: {e}")
 
-    return _process_source(
-        source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
-        req.voiceover, req.voiceover_voice, req.zoom_pan, req.color_preset, req.url,
+    opts = dict(
+        voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
+        zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
+        sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
+        bg_music_url=req.bg_music_url, flash_intro=req.flash_intro,
     )
+    return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
+                            opts, req.url)
 
 
 # Upload size cap: keeps a single request from blowing out Railway's small
@@ -960,8 +1266,15 @@ async def process_upload(
     instruction: str = Form(""),
     voiceover: bool = Form(False),
     voiceover_voice: str = Form(DEFAULT_VOICE),
+    voiceover_style: str = Form(DEFAULT_VOICEOVER_STYLE),
     zoom_pan: bool = Form(False),
     color_preset: str = Form("none"),
+    caption_style: str = Form(DEFAULT_CAPTION_STYLE),
+    sfx: str = Form("none"),
+    sfx_position: str = Form("end"),
+    typing_sound: bool = Form(False),
+    bg_music_url: str = Form(""),
+    flash_intro: bool = Form(False),
 ):
     """Same pipeline as /process, but for a video the user uploads directly
     instead of a YouTube/Twitch/etc URL — skips yt-dlp entirely, so this
@@ -995,10 +1308,14 @@ async def process_upload(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, "Uploaded file is empty.")
 
-    return _process_source(
-        source, job_dir, job_id, clip_count, clip_seconds, instruction,
-        voiceover, voiceover_voice, zoom_pan, color_preset, "uploaded file",
+    opts = dict(
+        voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
+        zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
+        sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
+        bg_music_url=bg_music_url, flash_intro=flash_intro,
     )
+    return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
+                            opts, "uploaded file")
 
 
 @app.post("/reclip")
@@ -1030,20 +1347,26 @@ def reclip(req: ReclipRequest):
         start, end = picks[0]["start"], picks[0]["end"]
 
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
-    words_to_ass(words, start, end, ass_path)
+    words_to_ass(words, start, end, ass_path, caption_style=req.caption_style)
 
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name
     try:
         cut_and_caption(source, start, end, ass_path, out_path,
-                         zoom_pan=req.zoom_pan, color_preset=req.color_preset)
+                         zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro)
     except Exception as e:
         raise HTTPException(500, f"Failed to render clip: {e}")
 
     voiceover_script = apply_voiceover_if_wanted(
         source, job_dir, out_path, start, end, req.clip_seconds,
-        words, req.voiceover, req.voiceover_voice, req.instruction,
+        words, req.voiceover, req.voiceover_voice, req.instruction, req.voiceover_style,
     )
+
+    bg_music_path = download_bg_music(req.bg_music_url, job_dir) if req.bg_music_url else None
+    mixed_path = out_path.with_suffix(".mix.mp4")
+    if apply_audio_extras(out_path, mixed_path, end - start, req.sfx, req.sfx_position,
+                           req.typing_sound, bg_music_path):
+        mixed_path.replace(out_path)
 
     return {
         "file": out_name,
@@ -1091,6 +1414,21 @@ def list_color_presets():
     return {"presets": COLOR_PRESETS, "default": "none"}
 
 
+@app.get("/caption-styles")
+def list_caption_styles():
+    return {"styles": list(CAPTION_STYLES.keys()), "default": DEFAULT_CAPTION_STYLE}
+
+
+@app.get("/voiceover-styles")
+def list_voiceover_styles():
+    return {"styles": list(VOICEOVER_STYLES.keys()), "default": DEFAULT_VOICEOVER_STYLE}
+
+
+@app.get("/sound-effects")
+def list_sound_effects():
+    return {"effects": SOUND_EFFECTS, "default": "none"}
+
+
 @app.get("/health")
 def health():
     return {
@@ -1102,4 +1440,8 @@ def health():
         "direct_upload": "enabled",
         "zoom_pan": "enabled",
         "color_grading": "enabled",
+        "caption_styles": "enabled",
+        "sound_effects": "enabled",
+        "background_music": "enabled",
+        "fades": "enabled",
     }

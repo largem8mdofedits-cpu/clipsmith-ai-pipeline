@@ -454,7 +454,7 @@ def _ass_timestamp(t: float) -> str:
     return f"{h:d}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chunk_size: int = 5):
+def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chunk_size: int = 4):
     """Writes an .ass subtitle file scoped to one clip's time range: words
     highlight from white to yellow exactly as they're spoken (ASS karaoke
     \\k tags), AND each word pops with a quick scale bounce the instant
@@ -479,7 +479,16 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
         "ScriptType: v4.00+\n"
         "PlayResX: 1080\n"
         "PlayResY: 1920\n"
-        "WrapStyle: 0\n"
+        # WrapStyle 2 = no automatic line-wrapping. With WrapStyle 0 (the
+        # previous setting), libass recalculates line breaks live off the
+        # CURRENT rendered width — and since each word's pop-scale bounce
+        # briefly makes it ~1/5 wider, a line that fit on one row would
+        # momentarily overflow, get auto-wrapped onto two rows, then snap
+        # back to one row the instant the pop finished. That's the visible
+        # "scales and goes back to normal" glitch. WrapStyle 2 fixes it by
+        # never re-wrapping — combined with the smaller pop below and
+        # smaller word-group size, lines stay comfortably within frame.
+        "WrapStyle: 2\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
@@ -494,7 +503,9 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
     # group into on-screen lines of `chunk_size` words each
     chunks = [clip_words[i:i + chunk_size] for i in range(0, len(clip_words), chunk_size)]
 
-    POP_MS = 90  # how long the scale-up half of each word's pop takes
+    POP_MS = 90    # how long the scale-up half of each word's pop takes
+    POP_SCALE = 110  # was 122 — smaller bump leaves more margin before a line
+                     # could ever overflow its row, on top of the WrapStyle fix above
 
     lines = [header]
     for chunk in chunks:
@@ -519,7 +530,7 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path, chun
             pop_end = word_offset_ms + POP_MS * 2
             karaoke_text += (
                 f"{{\\k{dur_cs}"
-                f"\\t({pop_start},{pop_mid},\\fscx122\\fscy122)"
+                f"\\t({pop_start},{pop_mid},\\fscx{POP_SCALE}\\fscy{POP_SCALE})"
                 f"\\t({pop_mid},{pop_end},\\fscx100\\fscy100)}}"
                 f"{word} "
             )

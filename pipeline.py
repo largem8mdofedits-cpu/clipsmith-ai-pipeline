@@ -58,6 +58,8 @@ class ProcessRequest(BaseModel):
     url: str
     clip_count: int = 3
     clip_seconds: int = 30
+    instruction: str = ""  # optional free-text steer for Claude's highlight picking,
+                            # e.g. "focus on the part where they argue about money"
 
 
 # ---------------------------------------------------------------------------
@@ -197,22 +199,36 @@ def build_timestamped_transcript(words, bucket_seconds: int = 10) -> str:
     return "\n".join(lines)
 
 
-def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duration: float):
+def pick_highlights_llm(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = ""):
     """Asks Claude to pick the best moments in the video for short-form
     clips — hooks, punchlines, surprising or emotional beats — rather than
     just the windows with the most words in them. Returns None (so the
     caller falls back to the heuristic) if no API key is set or anything
     about the call/parsing goes wrong, so a flaky LLM response never takes
-    down clip generation entirely."""
+    down clip generation entirely.
+
+    `instruction` is an optional free-text steer from the user (e.g. "focus
+    on the part where they argue about money", "find the funniest moment")
+    — when present it's given priority over the generic hook/punchline
+    criteria, letting the user directly control what the AI looks for
+    instead of only ever getting one fixed notion of "best"."""
     if not ANTHROPIC_API_KEY or not words:
         return None
 
     transcript = build_timestamped_transcript(words)
+    instruction = (instruction or "").strip()
+    steer = (
+        f"The user specifically asked for: \"{instruction}\" — prioritize this over "
+        f"generic criteria; only fall back to hooks/punchlines/emotional beats for any "
+        f"remaining clips if the instruction doesn't specify enough moments.\n\n"
+        if instruction else ""
+    )
     prompt = (
         f"You're picking the {clip_count} best {clip_seconds}-second moments from this "
         f"video transcript, to turn into short-form clips for TikTok/Reels/Shorts. Look "
         f"for hooks, punchlines, surprising claims, or emotional beats — not just the "
         f"parts with the most talking.\n\n"
+        f"{steer}"
         f"Transcript (format: [seconds] words spoken from that point):\n{transcript}\n\n"
         f"The video is {total_duration:.0f} seconds long. Pick {clip_count} start times, "
         f"each at least {clip_seconds} seconds before the video ends, and at least "
@@ -288,8 +304,8 @@ def pick_highlights_heuristic(words, clip_count: int, clip_seconds: int, total_d
     return chosen
 
 
-def pick_highlights(words, clip_count: int, clip_seconds: int, total_duration: float):
-    llm_picks = pick_highlights_llm(words, clip_count, clip_seconds, total_duration)
+def pick_highlights(words, clip_count: int, clip_seconds: int, total_duration: float, instruction: str = ""):
+    llm_picks = pick_highlights_llm(words, clip_count, clip_seconds, total_duration, instruction)
     if llm_picks:
         return llm_picks
     return pick_highlights_heuristic(words, clip_count, clip_seconds, total_duration)
@@ -448,7 +464,7 @@ def process(req: ProcessRequest):
         except Exception as e:
             raise HTTPException(500, f"Transcription failed: {e}")
 
-        highlights = pick_highlights(words, req.clip_count, req.clip_seconds, duration)
+        highlights = pick_highlights(words, req.clip_count, req.clip_seconds, duration, req.instruction)
 
         if not highlights:
             raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")

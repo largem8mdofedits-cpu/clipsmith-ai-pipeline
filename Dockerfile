@@ -39,6 +39,27 @@ RUN mkdir -p /app/piper_voices && \
       curl -fsSL "$PIPER_BASE/$v/medium/en_US-$v-medium.onnx.json" -o "/app/piper_voices/en_US-$v-medium.onnx.json"; \
     done
 
+# Self-hosted AI tools — background remover (rembg), vocal remover
+# (Demucs), speech enhancer (DeepFilterNet). All three run entirely in
+# this container: no API key, no per-call cost, no rate limit, same
+# philosophy as the Piper voices above. Model weights are pre-downloaded
+# here (not on first request) so a cold user request never has to wait
+# on a multi-hundred-MB download. rembg/Demucs downloads are a known,
+# required step — if either fails, the build SHOULD fail loudly rather
+# than ship a tool that's silently broken.
+RUN python3 -c "from rembg import new_session; new_session('u2net')" && \
+    python3 -c "from demucs.pretrained import get_model; get_model('htdemucs')"
+
+# DeepFilterNet ships its model inside the pip package (no download
+# needed), so this is just a warm-up run to surface a broken install at
+# build time instead of on a user's first request — non-fatal (|| true)
+# since, unlike the two tools above, a failure here doesn't mean a
+# missing model, just a CLI quirk worth investigating rather than
+# blocking every other deploy.
+RUN ffmpeg -f lavfi -i anullsrc=r=48000:cl=mono -t 1 -y /tmp/silence.wav && \
+    (deepFilter /tmp/silence.wav --output-dir /tmp/df_warmup || true) && \
+    rm -f /tmp/silence.wav && rm -rf /tmp/df_warmup
+
 COPY . .
 
 # Re-pull the newest yt-dlp release on every build. requirements.txt pins

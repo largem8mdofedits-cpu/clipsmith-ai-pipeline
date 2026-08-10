@@ -42,11 +42,22 @@ from pydantic import BaseModel
 # unavailable instead of crashing.
 try:
     from rembg import new_session as _rembg_new_session, remove as rembg_remove
-    REMBG_SESSION = _rembg_new_session("u2net")
 except Exception as e:
     print(f"rembg not available: {e}")
     rembg_remove = None
-    REMBG_SESSION = None
+    _rembg_new_session = None
+
+# The U^2-Net session itself is built lazily on first use, not at import —
+# this container has a 1GB memory ceiling (Railway Hobby plan), and holding
+# a ~200-300MB ONNX session resident for the life of the process ate into
+# the headroom Demucs/DeepFilterNet need for their own (much bigger) spikes,
+# even on requests that never touch background removal at all.
+_rembg_session_cache = None
+def get_rembg_session():
+    global _rembg_session_cache
+    if _rembg_session_cache is None and _rembg_new_session is not None:
+        _rembg_session_cache = _rembg_new_session("u2net")
+    return _rembg_session_cache
 
 app = FastAPI(title="Clipsmith cloud pipeline")
 
@@ -61,6 +72,15 @@ app.add_middleware(
 
 OUTPUT_DIR = Path(__file__).parent / "clips"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# This container has a hard 1GB memory ceiling (Railway Hobby plan). Demucs
+# and DeepFilterNet can each spike well past a few hundred MB on their own;
+# two of them (or one plus a concurrent clip render) running at the same
+# instant is what actually risks an OOM kill, not either one alone. This
+# lock forces the memory-heavy self-hosted tools to run one at a time per
+# replica instead of overlapping — costs some latency under concurrent
+# load, costs nothing when idle.
+HEAVY_TASK_LOCK = asyncio.Lock()
 
 # Serves finished clips at http://<host>/clips/<filename>.mp4 — without
 # this, the URLs returned by /process below 404.
@@ -1705,7 +1725,8 @@ async def remove_background(file: UploadFile = File(...)):
         raise HTTPException(413, "Image is too large (15MB max).")
 
     try:
-        result = rembg_remove(raw, session=REMBG_SESSION)
+        async with HEAVY_TASK_LOCK:
+            result = rembg_remove(raw, session=get_rembg_session())
     except Exception as e:
         raise HTTPException(500, f"Background removal failed: {e}")
 
@@ -1758,11 +1779,17 @@ async def remove_vocals(file: UploadFile = File(...)):
                 raise HTTPException(500, f"Could not extract audio from that video: {result.stderr[-800:]}")
 
         out_dir = work_dir / "out"
-        result = subprocess.run(
-            ["python3", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
-             "-o", str(out_dir), str(audio_path)],
-            capture_output=True, text=True, timeout=600,
-        )
+        # --segment caps how much audio Demucs holds in memory at once —
+        # without it, peak memory scales with the whole track's length,
+        # which is what was pushing this container past its 1GB ceiling.
+        # -j 1 keeps it to a single worker instead of spinning up parallel
+        # copies of the model. Both trade a bit of speed for a lot less RAM.
+        async with HEAVY_TASK_LOCK:
+            result = subprocess.run(
+                ["python3", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+                 "--segment", "8", "-j", "1", "-o", str(out_dir), str(audio_path)],
+                capture_output=True, text=True, timeout=600,
+            )
         if result.returncode != 0:
             raise HTTPException(500, f"Vocal separation failed: {result.stderr[-1000:]}")
 
@@ -1810,10 +1837,11 @@ async def enhance_speech(file: UploadFile = File(...)):
 
         out_dir = work_dir / "out"
         out_dir.mkdir(exist_ok=True)
-        result = subprocess.run(
-            ["deepFilter", str(wav_path), "--output-dir", str(out_dir)],
-            capture_output=True, text=True, timeout=180,
-        )
+        async with HEAVY_TASK_LOCK:
+            result = subprocess.run(
+                ["deepFilter", str(wav_path), "--output-dir", str(out_dir)],
+                capture_output=True, text=True, timeout=180,
+            )
         if result.returncode != 0:
             raise HTTPException(500, f"Speech enhancement failed: {result.stderr[-1000:]}")
 

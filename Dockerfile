@@ -25,6 +25,20 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Piper TTS voice models — self-hosted, zero-API-key fallback for
+# voice-over (see synthesize_voiceover() in pipeline.py). Pinned to the
+# v1.0.0 tag of rhasspy/piper-voices on Hugging Face rather than `main` so
+# a rebuild can't silently pull a renamed/moved file. ~50-70MB each; six
+# voices keeps the image growth reasonable while still giving the frontend
+# voice picker real variety. Placed before COPY . . so editing pipeline.py
+# doesn't bust this layer's cache and re-download ~300MB every build.
+RUN mkdir -p /app/piper_voices && \
+    PIPER_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US" && \
+    for v in amy ryan kristin joe ljspeech john; do \
+      curl -fsSL "$PIPER_BASE/$v/medium/en_US-$v-medium.onnx" -o "/app/piper_voices/en_US-$v-medium.onnx" && \
+      curl -fsSL "$PIPER_BASE/$v/medium/en_US-$v-medium.onnx.json" -o "/app/piper_voices/en_US-$v-medium.onnx.json"; \
+    done
+
 COPY . .
 
 # Re-pull the newest yt-dlp release on every build. requirements.txt pins

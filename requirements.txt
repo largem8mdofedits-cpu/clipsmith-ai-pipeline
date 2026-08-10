@@ -5,3 +5,13 @@ yt-dlp
 httpx
 bgutil-ytdlp-pot-provider
 piper-tts
+
+# Self-hosted AI tools — background remover, vocal remover, speech
+# enhancer. CPU-only torch wheel (much smaller than the default CUDA
+# build) since this container has no GPU.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio
+demucs
+deepfilternet
+rembg

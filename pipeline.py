@@ -15,6 +15,7 @@ See README.md in this folder for full setup instructions.
 """
 
 import base64
+import importlib.util
 import os
 import json
 import re
@@ -30,6 +31,21 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# Self-hosted background remover (see /remove-background below). Imported
+# once at module load — not per-request — so the ONNX model session is
+# built a single time and reused, instead of paying that cost on every
+# call. Guarded the same way Piper's voice files are: if the package or
+# model isn't there (e.g. an older deploy that predates this feature),
+# the whole service still starts up fine and just reports the tool as
+# unavailable instead of crashing.
+try:
+    from rembg import new_session as _rembg_new_session, remove as rembg_remove
+    REMBG_SESSION = _rembg_new_session("u2net")
+except Exception as e:
+    print(f"rembg not available: {e}")
+    rembg_remove = None
+    REMBG_SESSION = None
 
 app = FastAPI(title="Clipsmith cloud pipeline")
 
@@ -58,6 +74,13 @@ app.mount("/clips", StaticFiles(directory=str(OUTPUT_DIR)), name="clips")
 JOBS_DIR = Path(__file__).parent / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 JOB_TTL_SECONDS = 3 * 60 * 60  # old job folders are swept on a delay, not kept forever
+
+# Scratch space for the standalone AI tools (background remover, vocal
+# remover, speech enhancer) — each request gets its own subfolder here,
+# deleted again once the response is built. Unlike JOBS_DIR these aren't
+# meant to outlive the request (no reclip-style follow-up call needs them).
+TOOLS_DIR = Path(__file__).parent / "tools_tmp"
+TOOLS_DIR.mkdir(exist_ok=True)
 
 
 def cleanup_old_jobs():
@@ -1603,6 +1626,150 @@ def remove_music(job_id: str = Form(...)):
     return {"ok": True}
 
 
+@app.post("/remove-background")
+async def remove_background(file: UploadFile = File(...)):
+    """Removes the background from an uploaded image using rembg — fully
+    self-hosted (U^2-Net model baked into the Docker image, see Dockerfile),
+    so this has no API key, no per-call cost, and no rate limit. Returns a
+    transparent PNG.
+
+    Video background removal isn't wired up yet: doing it at real quality
+    means running this per-frame and re-encoding, which is too slow for a
+    single request/response on a CPU-only container — that's a follow-up,
+    not something silently half-done here."""
+    if rembg_remove is None:
+        raise HTTPException(501, "Background removal isn't available on this server (rembg failed to load).")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Uploaded file is empty.")
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(413, "Image is too large (15MB max).")
+
+    try:
+        result = rembg_remove(raw, session=REMBG_SESSION)
+    except Exception as e:
+        raise HTTPException(500, f"Background removal failed: {e}")
+
+    out_name = f"bgremoved_{uuid.uuid4().hex[:8]}.png"
+    (OUTPUT_DIR / out_name).write_bytes(result)
+    return {"url": f"/clips/{out_name}"}
+
+
+@app.post("/remove-vocals")
+async def remove_vocals(file: UploadFile = File(...)):
+    """Splits an uploaded audio or video file into vocals + instrumental
+    tracks using Demucs (self-hosted, htdemucs model baked into the
+    Docker image — no API key, no cost). CPU-only inference, so a full
+    song can take a minute or two; that's expected, not a hang."""
+    work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        raw_name = file.filename or "input.audio"
+        src_ext = Path(raw_name).suffix or ".mp3"
+        src_path = work_dir / f"src{src_ext}"
+        size = 0
+        try:
+            with open(src_path, "wb") as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 100 * 1024 * 1024:
+                        raise HTTPException(413, "File is too large (100MB max).")
+                    f.write(chunk)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"Could not read uploaded file: {e}")
+        if size == 0:
+            raise HTTPException(400, "Uploaded file is empty.")
+
+        # Demucs wants an audio file — pull the audio track out first with
+        # ffmpeg (already in this container for clip rendering) if a video
+        # was uploaded instead.
+        audio_path = src_path
+        if src_ext.lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
+            audio_path = work_dir / "audio.wav"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src_path), "-vn", "-acodec", "pcm_s16le", str(audio_path)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise HTTPException(500, f"Could not extract audio from that video: {result.stderr[-800:]}")
+
+        out_dir = work_dir / "out"
+        result = subprocess.run(
+            ["python3", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+             "-o", str(out_dir), str(audio_path)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"Vocal separation failed: {result.stderr[-1000:]}")
+
+        stem_dir = out_dir / "htdemucs" / audio_path.stem
+        vocals_src = stem_dir / "vocals.wav"
+        instrumental_src = stem_dir / "no_vocals.wav"
+        if not (vocals_src.exists() and instrumental_src.exists()):
+            raise HTTPException(500, "Vocal separation finished but the output files are missing.")
+
+        vocals_name = f"vocals_{uuid.uuid4().hex[:8]}.wav"
+        instrumental_name = f"instrumental_{uuid.uuid4().hex[:8]}.wav"
+        shutil.copy(vocals_src, OUTPUT_DIR / vocals_name)
+        shutil.copy(instrumental_src, OUTPUT_DIR / instrumental_name)
+        return {"vocals_url": f"/clips/{vocals_name}", "instrumental_url": f"/clips/{instrumental_name}"}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/enhance-speech")
+async def enhance_speech(file: UploadFile = File(...)):
+    """Denoises/cleans up an uploaded voice recording using DeepFilterNet
+    (self-hosted — model ships inside the pip package, no download at
+    request time, no API key, no cost). DeepFilterNet only accepts 48kHz
+    mono wav, so the input is resampled with ffmpeg first regardless of
+    what format it was uploaded in."""
+    work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(400, "Uploaded file is empty.")
+        if len(raw) > 50 * 1024 * 1024:
+            raise HTTPException(413, "Audio file is too large (50MB max).")
+
+        src_path = work_dir / "src.audio"
+        src_path.write_bytes(raw)
+
+        wav_path = work_dir / "input.wav"
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src_path), "-ar", "48000", "-ac", "1", str(wav_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"Could not read that audio file: {result.stderr[-800:]}")
+
+        out_dir = work_dir / "out"
+        out_dir.mkdir(exist_ok=True)
+        result = subprocess.run(
+            ["deepFilter", str(wav_path), "--output-dir", str(out_dir)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"Speech enhancement failed: {result.stderr[-1000:]}")
+
+        enhanced_src = out_dir / wav_path.name
+        if not enhanced_src.exists():
+            raise HTTPException(500, "Enhancement finished but the output file is missing.")
+
+        out_name = f"enhanced_{uuid.uuid4().hex[:8]}.wav"
+        shutil.copy(enhanced_src, OUTPUT_DIR / out_name)
+        return {"url": f"/clips/{out_name}"}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @app.post("/regenerate-voiceover")
 def regenerate_voiceover(req: RegenerateVoiceoverRequest):
     """Re-synthesizes a clip's narration from user-edited script text,
@@ -1681,4 +1848,10 @@ def health():
         "sound_effects": "enabled",
         "background_music": "enabled",
         "fades": "enabled",
+        # Self-hosted tools — checked directly instead of just assumed, so
+        # a deploy that's missing a dependency reports honestly instead of
+        # claiming a tool that isn't really there.
+        "background_remover": "rembg (self-hosted)" if rembg_remove is not None else "unavailable",
+        "vocal_remover": "demucs (self-hosted)" if importlib.util.find_spec("demucs") else "unavailable",
+        "speech_enhancer": "deepfilternet (self-hosted)" if shutil.which("deepFilter") else "unavailable",
     }

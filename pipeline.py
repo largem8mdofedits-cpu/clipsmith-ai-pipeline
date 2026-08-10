@@ -89,6 +89,29 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # these tools into their own service with its own separate 1GB budget.
 HEAVY_TASK_LOCK = asyncio.Lock()
 
+# Gemini's free tier gives this whole SITE a shared per-minute request
+# budget for image generation — it's not per-user, so two people generating
+# within the same few seconds of each other can knock each other into a 429
+# even when neither of them is individually over any limit. Rather than let
+# that be a race (whoever's request lands first "wins", everyone else gets
+# a raw error), every /generate-image call queues behind this lock and
+# waits out a minimum spacing since the last call before firing — so
+# concurrent users share the quota fairly (FIFO, evenly paced) instead of
+# fighting over it. GEMINI_MIN_INTERVAL_SECONDS is conservative (10 req/min)
+# since Google doesn't publish an exact number for this preview model.
+GEMINI_RATE_LOCK = asyncio.Lock()
+GEMINI_MIN_INTERVAL_SECONDS = float(os.environ.get("GEMINI_MIN_INTERVAL_SECONDS", "6"))
+_last_gemini_call_at = 0.0
+
+async def _wait_for_gemini_turn():
+    global _last_gemini_call_at
+    async with GEMINI_RATE_LOCK:
+        now = time.monotonic()
+        wait = GEMINI_MIN_INTERVAL_SECONDS - (now - _last_gemini_call_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_gemini_call_at = time.monotonic()
+
 # Serves finished clips at http://<host>/clips/<filename>.mp4 — without
 # this, the URLs returned by /process below 404.
 app.mount("/clips", StaticFiles(directory=str(OUTPUT_DIR)), name="clips")
@@ -1906,6 +1929,11 @@ async def generate_image(prompt: str = Form(...)):
 
     try:
         async with HEAVY_TASK_LOCK:
+            # Waiting inside the lock means two concurrent requests queue up
+            # in strict arrival order and each waits its fair turn, instead
+            # of both waiting the same interval and racing each other for
+            # who actually gets to fire first.
+            await _wait_for_gemini_turn()
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",

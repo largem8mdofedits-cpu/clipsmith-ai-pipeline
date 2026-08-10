@@ -88,6 +88,13 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 # permanent fix, just a temporary boost, hence the POT provider below.
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+# Google Cloud Text-to-Speech — a plain API key (Cloud Console > APIs &
+# Services > Credentials > Create API Key, then restrict it to the
+# "Cloud Text-to-Speech API"), not a service-account JSON file. Simpler to
+# hand to Railway as one env var, same pattern as every other key here.
+# Free tier: 4M chars/mo (Standard voices) + 1M chars/mo (Neural2) forever —
+# see synthesize_voiceover() below for why this is tried before ElevenLabs.
+GOOGLE_TTS_API_KEY = os.environ.get("GOOGLE_TTS_API_KEY")
 
 # URL of a self-hosted bgutil-ytdlp-pot-provider instance (see
 # https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — generates
@@ -106,6 +113,32 @@ ELEVENLABS_VOICES = {
     "Antoni": "ErXwobaYiN019PkySvjV",   # warm, male, US
     "Elli":   "MF3mGyEYCl7XYWbV9V6O",   # young, female, US
     "Josh":   "TxGEqnHWrfWFTfGW9XjX",   # casual, male, US
+}
+# Same friendly names, mapped onto Google's en-US Neural2 voices instead —
+# keeps the /voices list and frontend voice picker identical no matter
+# which provider actually ends up synthesizing the audio (see
+# synthesize_voiceover() below). Google's Neural2-{A,D,I,J} are male,
+# {C,E,F,G,H} are female.
+GOOGLE_TTS_VOICES = {
+    "Rachel": {"languageCode": "en-US", "name": "en-US-Neural2-F", "ssmlGender": "FEMALE"},
+    "Adam":   {"languageCode": "en-US", "name": "en-US-Neural2-D", "ssmlGender": "MALE"},
+    "Bella":  {"languageCode": "en-US", "name": "en-US-Neural2-C", "ssmlGender": "FEMALE"},
+    "Antoni": {"languageCode": "en-US", "name": "en-US-Neural2-A", "ssmlGender": "MALE"},
+    "Elli":   {"languageCode": "en-US", "name": "en-US-Neural2-G", "ssmlGender": "FEMALE"},
+    "Josh":   {"languageCode": "en-US", "name": "en-US-Neural2-J", "ssmlGender": "MALE"},
+}
+# Same friendly names again, mapped onto self-hosted Piper voice models
+# (downloaded into /app/piper_voices at build time — see Dockerfile). No
+# API key, no external network call, no per-character cost, ever — the
+# always-available last resort in synthesize_voiceover()'s fallback chain.
+PIPER_VOICES_DIR = Path(__file__).parent / "piper_voices"
+PIPER_VOICES = {
+    "Rachel": "en_US-amy-medium",       # calm, female
+    "Adam":   "en_US-ryan-medium",      # deep, male
+    "Bella":  "en_US-kristin-medium",   # soft, female
+    "Antoni": "en_US-joe-medium",       # warm, male
+    "Elli":   "en_US-ljspeech-medium",  # young, female
+    "Josh":   "en_US-john-medium",      # casual, male
 }
 DEFAULT_VOICE = "Rachel"
 
@@ -904,12 +937,45 @@ def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instru
         return ""
 
 
-def synthesize_voiceover(script: str, voice_name: str, dest: Path) -> Optional[Path]:
+def _synthesize_google_tts(script: str, voice_name: str, dest: Path) -> Optional[Path]:
+    """Calls Google Cloud Text-to-Speech (REST, plain API key — no service
+    account JSON needed). Returns None on any failure, same "never raise"
+    contract as _synthesize_elevenlabs below."""
+    if not GOOGLE_TTS_API_KEY:
+        return None
+
+    voice = GOOGLE_TTS_VOICES.get(voice_name, GOOGLE_TTS_VOICES[DEFAULT_VOICE])
+    try:
+        resp = httpx.post(
+            f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_TTS_API_KEY}",
+            json={
+                "input": {"text": script},
+                "voice": voice,
+                "audioConfig": {"audioEncoding": "MP3"},
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print(f"Google TTS error {resp.status_code}: {resp.text[:500]}")
+            return None
+        audio_b64 = resp.json().get("audioContent")
+        if not audio_b64:
+            print("Google TTS response had no audioContent")
+            return None
+        audio_path = dest / f"voiceover_{uuid.uuid4().hex[:8]}.mp3"
+        audio_path.write_bytes(base64.b64decode(audio_b64))
+        return audio_path
+    except Exception as e:
+        print(f"Google TTS request failed: {e}")
+        return None
+
+
+def _synthesize_elevenlabs(script: str, voice_name: str, dest: Path) -> Optional[Path]:
     """Calls ElevenLabs to turn a script into speech. Returns None (never
     raises) on any failure — same "degrade gracefully" pattern as the rest
     of this pipeline, since voice-over is always an enhancement, never a
     requirement for a clip to come back successfully."""
-    if not ELEVENLABS_API_KEY or not script.strip():
+    if not ELEVENLABS_API_KEY:
         return None
 
     voice_id = ELEVENLABS_VOICES.get(voice_name, ELEVENLABS_VOICES[DEFAULT_VOICE])
@@ -937,6 +1003,56 @@ def synthesize_voiceover(script: str, voice_name: str, dest: Path) -> Optional[P
     except Exception as e:
         print(f"ElevenLabs request failed: {e}")
         return None
+
+
+def _synthesize_piper(script: str, voice_name: str, dest: Path) -> Optional[Path]:
+    """Synthesizes speech locally with Piper — no API key, no network
+    call, no per-character cost. Voice models are baked into the image at
+    /app/piper_voices (see Dockerfile). This is the last resort in
+    synthesize_voiceover()'s fallback chain, so it should essentially
+    never fail unless the model files themselves are missing."""
+    model_name = PIPER_VOICES.get(voice_name, PIPER_VOICES[DEFAULT_VOICE])
+    model_path = PIPER_VOICES_DIR / f"{model_name}.onnx"
+    if not model_path.exists():
+        print(f"Piper voice model missing: {model_path}")
+        return None
+
+    try:
+        audio_path = dest / f"voiceover_{uuid.uuid4().hex[:8]}.wav"
+        # Current piper-tts (OHF-Voice/piper1-gpl) CLI takes the text as a
+        # positional arg after `--`, not via stdin — see
+        # https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/CLI.md.
+        # Invoked as `python3 -m piper` rather than a bare `piper` binary
+        # since the module entry point is guaranteed by the pip package;
+        # a console-script shim isn't.
+        result = subprocess.run(
+            ["python3", "-m", "piper", "-m", str(model_path), "-f", str(audio_path), "--", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0 or not audio_path.exists():
+            print(f"Piper synthesis failed: {result.stderr[-1000:]}")
+            return None
+        return audio_path
+    except Exception as e:
+        print(f"Piper request failed: {e}")
+        return None
+
+
+def synthesize_voiceover(script: str, voice_name: str, dest: Path) -> Optional[Path]:
+    """Turns a narration script into speech, trying Google Cloud TTS first
+    (generous permanent free tier — see GOOGLE_TTS_API_KEY above), then
+    ElevenLabs if Google isn't configured or fails, then Piper (self-
+    hosted, no key needed — see _synthesize_piper above) as the final,
+    always-available fallback. Returns None (never raises) only if every
+    provider fails outright — voice-over is always an enhancement, never a
+    requirement for a clip to come back successfully."""
+    if not script.strip():
+        return None
+    return (
+        _synthesize_google_tts(script, voice_name, dest)
+        or _synthesize_elevenlabs(script, voice_name, dest)
+        or _synthesize_piper(script, voice_name, dest)
+    )
 
 
 def mux_voiceover(clip_path: Path, voiceover_path: Path, out_path: Path) -> bool:
@@ -971,10 +1087,13 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
     error to surface to the user."""
     if not (force or clip_word_count(words, start, end) < 3):
         return None
-    if not ELEVENLABS_API_KEY:
-        if force:
-            print("Voiceover requested but ELEVENLABS_API_KEY is not set — skipping.")
-        return None
+    # No provider-configured check here anymore — Piper (self-hosted, no
+    # API key) is always available as the last resort in
+    # synthesize_voiceover()'s fallback chain. The one thing that CAN still
+    # skip voice-over silently is generate_voiceover_script() below
+    # returning "" when ANTHROPIC_API_KEY isn't set/has no credits, since
+    # writing the narration text happens before any TTS provider is
+    # involved at all.
 
     try:
         frames = extract_sample_frames(source, start, end, job_dir)
@@ -1432,7 +1551,7 @@ def regenerate_voiceover(req: RegenerateVoiceoverRequest):
 
     vo_audio = synthesize_voiceover(req.script, req.voice, job_dir)
     if not vo_audio:
-        raise HTTPException(502, "Voice synthesis failed — check that ELEVENLABS_API_KEY is set correctly.")
+        raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
 
     muxed = clip_path.with_suffix(".vo.mp4")
     if not mux_voiceover(clip_path, vo_audio, muxed):
@@ -1469,13 +1588,24 @@ def list_sound_effects():
 
 @app.get("/health")
 def health():
+    voiceover_providers = []
+    if GOOGLE_TTS_API_KEY:
+        voiceover_providers.append("google")
+    if ELEVENLABS_API_KEY:
+        voiceover_providers.append("elevenlabs")
+    # Piper is baked into the image (see Dockerfile) and needs no API key,
+    # so it's always available as the last-resort fallback — but if the
+    # model files somehow didn't get downloaded during the build, report
+    # that honestly instead of claiming a provider that isn't really there.
+    if PIPER_VOICES_DIR.exists() and any(PIPER_VOICES_DIR.glob("*.onnx")):
+        voiceover_providers.append("piper (self-hosted)")
     return {
         "status": "ok",
         "transcription": "deepgram" if DEEPGRAM_API_KEY else "not configured",
         "highlight_picking": "claude" if ANTHROPIC_API_KEY else "heuristic fallback",
         "youtube_cookies": "configured" if YTDLP_COOKIES else "not set (may hit YouTube bot checks)",
         "pot_provider": "configured" if POT_PROVIDER_URL else "not set",
-        "voiceover": "elevenlabs" if ELEVENLABS_API_KEY else "not configured",
+        "voiceover": "+".join(voiceover_providers) if voiceover_providers else "not configured",
         "direct_upload": "enabled",
         "zoom_pan": "enabled",
         "color_grading": "enabled",

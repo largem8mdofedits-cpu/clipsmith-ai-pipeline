@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import List, Optional
@@ -1915,6 +1916,27 @@ async def synthesize_voice(script: str = Form(...), voice: str = Form(DEFAULT_VO
         gc.collect()
 
 
+async def _generate_image_pollinations(prompt: str) -> Optional[bytes]:
+    """Fallback image generator. Pollinations.ai is a free, keyless,
+    community-run image API (Flux-based) with no per-minute quota like
+    Gemini's — used when Gemini's shared free tier is exhausted so AI Images
+    doesn't just go down for everyone until the quota resets. Best-effort:
+    returns None on any failure so the caller falls back to the original
+    Gemini error instead of masking it with a worse, less specific one."""
+    try:
+        encoded = urllib.parse.quote(prompt, safe="")
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.get(
+                f"https://image.pollinations.ai/prompt/{encoded}",
+                params={"width": 1024, "height": 1024, "nologo": "true", "model": "flux"},
+            )
+            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+                return resp.content
+    except Exception:
+        pass
+    return None
+
+
 @app.post("/generate-image")
 async def generate_image(prompt: str = Form(...)):
     """Generates an image from a text prompt via Google's Gemini API
@@ -1945,22 +1967,32 @@ async def generate_image(prompt: str = Form(...)):
     finally:
         gc.collect()
 
-    if resp.status_code == 429:
-        # Gemini's free tier is a small SHARED quota across every user on
-        # this site, both per-minute and per-day — a 429 here means someone
-        # (possibly several people) just used it up, not that anything is
-        # broken. Extract the suggested retry delay if Google sent one.
-        retry_after = None
-        try:
-            detail = resp.json()
-            for err in detail.get("error", {}).get("details", []):
-                if err.get("@type", "").endswith("RetryInfo"):
-                    retry_after = err.get("retryDelay")
-        except Exception:
-            pass
-        wait_msg = f" Try again in about {retry_after}." if retry_after else " Try again in a minute."
-        raise HTTPException(429, f"AI Images is rate-limited right now (this runs on a shared free quota).{wait_msg}")
     if resp.status_code != 200:
+        # Gemini's free tier is a small SHARED quota across every user on
+        # this site, both per-minute and per-day — a failure here often just
+        # means someone (possibly several people) recently used it up, not
+        # that anything is broken. Try Pollinations.ai (free, keyless, no
+        # per-minute cap) before giving up, so AI Images stays usable instead
+        # of going down site-wide until Gemini's quota resets.
+        fallback_bytes = await _generate_image_pollinations(prompt)
+        if fallback_bytes:
+            out_name = f"image_{uuid.uuid4().hex[:8]}.png"
+            (OUTPUT_DIR / out_name).write_bytes(fallback_bytes)
+            del fallback_bytes
+            return {"url": f"/clips/{out_name}"}
+
+        if resp.status_code == 429:
+            # Extract Google's suggested retry delay if it sent one.
+            retry_after = None
+            try:
+                detail = resp.json()
+                for err in detail.get("error", {}).get("details", []):
+                    if err.get("@type", "").endswith("RetryInfo"):
+                        retry_after = err.get("retryDelay")
+            except Exception:
+                pass
+            wait_msg = f" Try again in about {retry_after}." if retry_after else " Try again in a minute."
+            raise HTTPException(429, f"AI Images is rate-limited right now (this runs on a shared free quota).{wait_msg}")
         raise HTTPException(502, f"Image generation failed ({resp.status_code}): {resp.text[-800:]}")
 
     data = resp.json()

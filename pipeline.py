@@ -1497,26 +1497,34 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
 
 
 @app.post("/process")
-def process(req: ProcessRequest):
+async def process(req: ProcessRequest):
     cleanup_old_jobs()
 
     job_id = str(uuid.uuid4())[:8]
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        source = download_video(req.url, job_dir)
-    except Exception as e:
-        raise HTTPException(400, f"Could not download video: {e}")
+    # This is the core clip-rendering pipeline (transcription + ffmpeg
+    # re-encode + voiceover + audio mix) — by far the heaviest, longest-
+    # running work in the whole app, and previously the one major path NOT
+    # covered by HEAVY_TASK_LOCK (only the smaller AI Tools endpoints were).
+    # That gap is what let a rendering job get OOM-killed (exit code -9)
+    # when it landed alongside other heavy work — see /reclip and
+    # /process-upload below for the same fix.
+    async with HEAVY_TASK_LOCK:
+        try:
+            source = download_video(req.url, job_dir)
+        except Exception as e:
+            raise HTTPException(400, f"Could not download video: {e}")
 
-    opts = dict(
-        voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
-        zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
-        sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
-        flash_intro=req.flash_intro,
-    )
-    return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
-                            opts, req.url)
+        opts = dict(
+            voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
+            zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
+            sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
+            flash_intro=req.flash_intro,
+        )
+        return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
+                                opts, req.url)
 
 
 # Upload size cap: keeps a single request from blowing out Railway's small
@@ -1580,12 +1588,15 @@ async def process_upload(
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
         flash_intro=flash_intro,
     )
-    return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
-                            opts, "uploaded file")
+    # See /process above — same memory-safety lock around the actual
+    # transcription/render/voiceover/mix work, not the upload itself.
+    async with HEAVY_TASK_LOCK:
+        return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
+                                opts, "uploaded file")
 
 
 @app.post("/reclip")
-def reclip(req: ReclipRequest):
+async def reclip(req: ReclipRequest):
     """Regenerates one clip from an already-processed video — either at an
     explicit start time, or auto-picked to avoid the time ranges already
     used (exclude_starts). Reuses the source video + transcript saved by
@@ -1617,22 +1628,27 @@ def reclip(req: ReclipRequest):
 
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name
-    try:
-        cut_and_caption(source, start, end, ass_path, out_path,
-                         zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to render clip: {e}")
 
-    voiceover_script = apply_voiceover_if_wanted(
-        source, job_dir, out_path, start, end, req.clip_seconds,
-        words, req.voiceover, req.voiceover_voice, req.instruction, req.voiceover_style,
-    )
+    # Same memory-safety lock as /process — this single "restyle/regenerate"
+    # button in the editor is a full re-render (cut + caption + voiceover +
+    # audio mix), not a cheap operation, and was previously unprotected.
+    async with HEAVY_TASK_LOCK:
+        try:
+            cut_and_caption(source, start, end, ass_path, out_path,
+                             zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to render clip: {e}")
 
-    bg_music_path = find_bg_music(job_dir)
-    mixed_path = out_path.with_suffix(".mix.mp4")
-    if apply_audio_extras(out_path, mixed_path, end - start, req.sfx, req.sfx_position,
-                           req.typing_sound, bg_music_path):
-        mixed_path.replace(out_path)
+        voiceover_script = apply_voiceover_if_wanted(
+            source, job_dir, out_path, start, end, req.clip_seconds,
+            words, req.voiceover, req.voiceover_voice, req.instruction, req.voiceover_style,
+        )
+
+        bg_music_path = find_bg_music(job_dir)
+        mixed_path = out_path.with_suffix(".mix.mp4")
+        if apply_audio_extras(out_path, mixed_path, end - start, req.sfx, req.sfx_position,
+                               req.typing_sound, bg_music_path):
+            mixed_path.replace(out_path)
 
     return {
         "file": out_name,
@@ -2156,7 +2172,6 @@ def regenerate_voiceover(req: RegenerateVoiceoverRequest):
     vo_audio = synthesize_voiceover(req.script, req.voice, job_dir)
     if not vo_audio:
         raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
-
     muxed = clip_path.with_suffix(".vo.mp4")
     if not mux_voiceover(clip_path, vo_audio, muxed):
         raise HTTPException(500, "Failed to combine the new narration with the clip.")

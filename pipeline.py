@@ -207,7 +207,6 @@ class ProcessRequest(BaseModel):
     sfx: str = "none"                  # one of SOUND_EFFECTS, one-shot
     sfx_position: str = "end"          # "start" or "end"
     typing_sound: bool = False         # ambient typing-click bed under the whole clip
-    bg_music_url: str = ""             # YouTube/YouTube Music link, mixed in at low volume
     flash_intro: bool = False          # white flash-in + shutter click instead of a plain fade
 
 
@@ -226,7 +225,6 @@ class ReclipRequest(BaseModel):
     sfx: str = "none"
     sfx_position: str = "end"
     typing_sound: bool = False
-    bg_music_url: str = ""
     flash_intro: bool = False
 
 
@@ -854,7 +852,11 @@ def clip_word_count(words, start: float, end: float) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Voice-over — Claude (vision) writes the script, ElevenLabs speaks it
+# Voice-over — the clip's own transcript is the script (free, no LLM call,
+# used whenever there's real dialogue in range), Claude+vision is a paid
+# fallback for genuinely silent/music-only clips, and Google/ElevenLabs/
+# Piper speak whatever script comes out of either path (see
+# synthesize_voiceover further down).
 # ---------------------------------------------------------------------------
 def extract_sample_frames(source: Path, start: float, end: float, dest: Path, n: int = 3) -> List[Path]:
     """Grabs n evenly-spaced still frames from [start, end] so Claude can
@@ -873,6 +875,21 @@ def extract_sample_frames(source: Path, start: float, end: float, dest: Path, n:
         else:
             print(f"Frame grab at {t:.1f}s failed: {result.stderr[-300:]}")
     return frames
+
+
+def transcript_script(words, start: float, end: float) -> str:
+    """Builds a narration script straight from the clip's own real
+    transcript for [start, end] — no LLM call, so it costs nothing and
+    never depends on ANTHROPIC_API_KEY having credits. This is now the
+    primary script source for a forced voice-over (see
+    apply_voiceover_if_wanted below): re-voicing the clip's existing
+    dialogue in a different voice, rather than Claude writing new
+    descriptive narration. Returns "" if nothing was transcribed in that
+    range (a genuinely silent/music-only clip has no words to read back),
+    in which case Claude+vision scene description is the only thing that
+    could fill it in — see the fallback in apply_voiceover_if_wanted."""
+    segment_words = [w["word"] for w in words if start <= w["start"] < end]
+    return " ".join(segment_words).strip()
 
 
 def generate_voiceover_script(frame_paths: List[Path], clip_seconds: int, instruction: str = "",
@@ -1089,15 +1106,19 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
         return None
     # No provider-configured check here anymore — Piper (self-hosted, no
     # API key) is always available as the last resort in
-    # synthesize_voiceover()'s fallback chain. The one thing that CAN still
-    # skip voice-over silently is generate_voiceover_script() below
-    # returning "" when ANTHROPIC_API_KEY isn't set/has no credits, since
-    # writing the narration text happens before any TTS provider is
-    # involved at all.
+    # synthesize_voiceover()'s fallback chain.
 
     try:
-        frames = extract_sample_frames(source, start, end, job_dir)
-        script = generate_voiceover_script(frames, clip_seconds, instruction, voiceover_style)
+        # Real transcript first — free, no LLM call, always available.
+        # Claude+vision is only reached for as a fallback when there's
+        # nothing transcribed to read back (a genuinely silent/music-only
+        # clip), and even then only does something if ANTHROPIC_API_KEY
+        # has credits — otherwise generate_voiceover_script() returns ""
+        # same as before and voice-over is skipped for that clip.
+        script = transcript_script(words, start, end)
+        if not script:
+            frames = extract_sample_frames(source, start, end, job_dir)
+            script = generate_voiceover_script(frames, clip_seconds, instruction, voiceover_style)
         if not script:
             return None
         vo_audio = synthesize_voiceover(script, voice_name, job_dir)
@@ -1175,34 +1196,21 @@ def _ensure_typing_loop() -> Optional[Path]:
         return None
 
 
-def download_bg_music(url: str, dest: Path) -> Optional[Path]:
-    """Downloads just the audio from a YouTube/YouTube Music link to use as
-    background music. Reuses the same player-client fallback + optional
-    cookies approach as download_video() since these are still youtube.com
-    requests subject to the same bot-detection. Returns None (never
-    raises) on failure — background music is always an enhancement, never
-    a requirement for a clip to render."""
-    out_template = str(dest / "bgmusic.%(ext)s")
-    cookies_path = None
-    if YTDLP_COOKIES:
-        cookies_path = dest / "cookies_music.txt"
-        cookies_path.write_text(YTDLP_COOKIES, encoding="utf-8")
+BG_MUSIC_EXTS = (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac")
 
-    for client in ["android", "ios", "tv", "mweb", "web_creator", "web"]:
-        args = [
-            "yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "m4a",
-            "--no-playlist", "--extractor-args", f"youtube:player_client={client}",
-        ]
-        if POT_PROVIDER_URL:
-            args += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
-        if cookies_path:
-            args += ["--cookies", str(cookies_path)]
-        args += ["-o", out_template, url]
-        result = subprocess.run(args, capture_output=True, text=True)
-        candidate = dest / "bgmusic.m4a"
-        if result.returncode == 0 and candidate.exists():
+
+def find_bg_music(job_dir: Path) -> Optional[Path]:
+    """Background music is now a direct file upload (see /upload-music)
+    saved once per job as job_dir/bgmusic.<ext>, instead of a YouTube link
+    that had to be downloaded via yt-dlp on every render — which used to
+    be a real source of bot-detection failures on top of the video
+    download itself. Every clip in a job shares the same track, so this
+    is checked fresh on each render instead of being threaded through
+    request bodies."""
+    for ext in BG_MUSIC_EXTS:
+        candidate = job_dir / f"bgmusic{ext}"
+        if candidate.exists():
             return candidate
-        print(f"bg-music download attempt with player_client={client} failed:\n{result.stderr[-600:]}")
     return None
 
 
@@ -1281,7 +1289,7 @@ def _default_opts() -> dict:
     return dict(
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
-        sfx="none", sfx_position="end", typing_sound=False, bg_music_url="", flash_intro=False,
+        sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
     )
 
 
@@ -1316,13 +1324,12 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
     if not highlights:
         raise HTTPException(422, "Couldn't find enough speech to build a clip from this video.")
 
-    # Background music is downloaded once per /process call (not once per
-    # clip) since every clip in the batch shares the same music track.
-    bg_music_path = None
-    if opts.get("bg_music_url"):
-        bg_music_path = download_bg_music(opts["bg_music_url"], job_dir)
-        if not bg_music_path:
-            print(f"Background music download failed for {opts['bg_music_url']!r} — continuing without it.")
+    # Background music is a file uploaded via /upload-music (see
+    # find_bg_music) — looked up once per /process call, not once per
+    # clip, since every clip in the batch shares the same music track.
+    # A fresh job has none yet on its very first render; it's picked up
+    # automatically once uploaded, on the next reclip/restyle.
+    bg_music_path = find_bg_music(job_dir)
 
     clips = []
     for i, h in enumerate(highlights):
@@ -1402,7 +1409,7 @@ def process(req: ProcessRequest):
         voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
         zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
         sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
-        bg_music_url=req.bg_music_url, flash_intro=req.flash_intro,
+        flash_intro=req.flash_intro,
     )
     return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
                             opts, req.url)
@@ -1429,7 +1436,6 @@ async def process_upload(
     sfx: str = Form("none"),
     sfx_position: str = Form("end"),
     typing_sound: bool = Form(False),
-    bg_music_url: str = Form(""),
     flash_intro: bool = Form(False),
 ):
     """Same pipeline as /process, but for a video the user uploads directly
@@ -1468,7 +1474,7 @@ async def process_upload(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
-        bg_music_url=bg_music_url, flash_intro=flash_intro,
+        flash_intro=flash_intro,
     )
     return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
                             opts, "uploaded file")
@@ -1518,7 +1524,7 @@ def reclip(req: ReclipRequest):
         words, req.voiceover, req.voiceover_voice, req.instruction, req.voiceover_style,
     )
 
-    bg_music_path = download_bg_music(req.bg_music_url, job_dir) if req.bg_music_url else None
+    bg_music_path = find_bg_music(job_dir)
     mixed_path = out_path.with_suffix(".mix.mp4")
     if apply_audio_extras(out_path, mixed_path, end - start, req.sfx, req.sfx_position,
                            req.typing_sound, bg_music_path):
@@ -1533,6 +1539,68 @@ def reclip(req: ReclipRequest):
         "has_voiceover": voiceover_script is not None,
         "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
     }
+
+
+# Upload size cap for background music — generous for a compressed audio
+# track (a 20MB mp3 is well over 20 minutes), tiny next to MAX_UPLOAD_BYTES
+# for video.
+BG_MUSIC_MAX_BYTES = 20 * 1024 * 1024
+
+
+@app.post("/upload-music")
+async def upload_music(job_id: str = Form(...), file: UploadFile = File(...)):
+    """Saves a user-uploaded background-music file for an existing job.
+    Replaces the old paste-a-YouTube-link approach, which needed a
+    yt-dlp download subject to the same bot-detection as video downloads.
+    Stored once per job as job_dir/bgmusic.<ext> (see find_bg_music) and
+    picked up automatically by every /reclip call afterward, since every
+    clip in a job shares the same track — call /reclip (or let the
+    frontend's debounced restyle do it) right after this to actually
+    re-render the current clip with the new track mixed in."""
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(404, "This session has expired — generate a clip again first.")
+
+    for old in job_dir.glob("bgmusic.*"):
+        old.unlink(missing_ok=True)
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in BG_MUSIC_EXTS:
+        ext = ".mp3"
+    dest = job_dir / f"bgmusic{ext}"
+    size = 0
+    try:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > BG_MUSIC_MAX_BYTES:
+                    raise HTTPException(413, "Music file is too large (20MB max).")
+                f.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read uploaded file: {e}")
+
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    return {"ok": True}
+
+
+@app.post("/remove-music")
+def remove_music(job_id: str = Form(...)):
+    """Clears a job's background-music track — the next /reclip call will
+    render with no music mixed in again."""
+    job_dir = JOBS_DIR / job_id
+    for old in job_dir.glob("bgmusic.*"):
+        old.unlink(missing_ok=True)
+    return {"ok": True}
 
 
 @app.post("/regenerate-voiceover")

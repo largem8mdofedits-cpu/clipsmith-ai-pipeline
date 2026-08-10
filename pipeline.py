@@ -14,6 +14,7 @@ Then POST a video URL to http://localhost:8000/process
 See README.md in this folder for full setup instructions.
 """
 
+import asyncio
 import base64
 import importlib.util
 import os
@@ -131,6 +132,22 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # script fallback above.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# D-ID — talking-avatar video generation. Free tier: ~5 min of video/month,
+# no card on file. Unlike the tools above, there's no free/self-hosted
+# substitute for this one (realistic lip-synced avatar video is a hard
+# problem), so this genuinely depends on the account's D-ID quota holding
+# up — see /generate-avatar-video below. Auth is HTTP Basic: D-ID hands
+# you a key already shaped "API_USERNAME:API_PASSWORD"; the whole string
+# gets base64-encoded for the Authorization header (standard HTTP Basic,
+# not a raw/unencoded value despite how the docs table reads).
+DID_API_KEY = os.environ.get("DID_API_KEY")
+
+# This service's own public URL — needed because D-ID's /talks endpoint
+# takes a source_url it fetches itself, not a raw file upload. An
+# uploaded photo is saved to OUTPUT_DIR (already served at /clips) and
+# referenced by its full public URL so D-ID's servers can reach it.
+PIPELINE_PUBLIC_URL = os.environ.get("PIPELINE_PUBLIC_URL", "https://clipsmith-ai-pipeline-production.up.railway.app")
 
 # URL of a self-hosted bgutil-ytdlp-pot-provider instance (see
 # https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — generates
@@ -1923,6 +1940,78 @@ async def brainstorm_ideas(topic: str = Form(...), idea_type: str = Form("Story 
     return {"ideas": [str(i) for i in ideas][:10]}
 
 
+def _did_auth_header() -> str:
+    return "Basic " + base64.b64encode(DID_API_KEY.encode()).decode()
+
+
+@app.post("/generate-avatar-video")
+async def generate_avatar_video(script: str = Form(...), image: UploadFile = File(...)):
+    """Generates a talking-avatar video via D-ID: an uploaded photo is
+    animated to lip-sync the given script. D-ID needs a public URL for
+    the source photo (not a raw upload), so the photo is saved to this
+    service's own /clips mount first and referenced by its public URL.
+    Generation is async on D-ID's side (POST returns immediately with a
+    "created" status), so this polls until it's done or times out.
+    D-ID's free tier is ~5 min of video/month, tracked on D-ID's own
+    account dashboard — not something this endpoint meters itself."""
+    if not DID_API_KEY:
+        raise HTTPException(501, "AI Videos isn't configured on this server (no DID_API_KEY).")
+    if not script.strip():
+        raise HTTPException(400, "Script can't be empty.")
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(400, "Uploaded photo is empty.")
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Photo is too large (10MB max).")
+
+    ext = Path(image.filename or "").suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        ext = ".jpg"
+    photo_name = f"avatar_src_{uuid.uuid4().hex[:8]}{ext}"
+    (OUTPUT_DIR / photo_name).write_bytes(raw)
+    photo_url = f"{PIPELINE_PUBLIC_URL}/clips/{photo_name}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            create_resp = await client.post(
+                "https://api.d-id.com/talks",
+                headers={"Authorization": _did_auth_header(), "Content-Type": "application/json"},
+                json={"source_url": photo_url, "script": {"type": "text", "input": script}},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach D-ID: {e}")
+
+    if create_resp.status_code not in (200, 201):
+        raise HTTPException(502, f"D-ID rejected the request ({create_resp.status_code}): {create_resp.text[-500:]}")
+
+    talk_id = create_resp.json().get("id")
+    if not talk_id:
+        raise HTTPException(502, "D-ID didn't return a talk ID.")
+
+    # Poll every 3s for up to ~4.5 minutes — comfortably under the 5-minute
+    # client-side fetch timeout tools.html uses for every tool on this page.
+    result_url = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        for _ in range(90):
+            await asyncio.sleep(3)
+            poll = await client.get(f"https://api.d-id.com/talks/{talk_id}", headers={"Authorization": _did_auth_header()})
+            if poll.status_code != 200:
+                continue
+            data = poll.json()
+            status = data.get("status")
+            if status == "done":
+                result_url = data.get("result_url")
+                break
+            if status == "error":
+                raise HTTPException(502, f"D-ID video generation failed: {data.get('error', {})}")
+
+    if not result_url:
+        raise HTTPException(504, "D-ID is taking longer than expected to render this video — try again in a bit.")
+
+    return {"video_url": result_url}
+
+
 @app.post("/regenerate-voiceover")
 def regenerate_voiceover(req: RegenerateVoiceoverRequest):
     """Re-synthesizes a clip's narration from user-edited script text,
@@ -2010,4 +2099,5 @@ def health():
         "ai_images": "gemini" if GEMINI_API_KEY else "not configured",
         "content_ideas": "groq" if GROQ_API_KEY else "not configured",
         "social_video_download": "enabled",
+        "ai_videos": "d-id" if DID_API_KEY else "not configured",
     }

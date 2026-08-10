@@ -4,3 +4,4 @@ python-multipart
 yt-dlp
 httpx
 bgutil-ytdlp-pot-provider
+piper-tts

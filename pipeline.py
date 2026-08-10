@@ -16,6 +16,7 @@ See README.md in this folder for full setup instructions.
 
 import asyncio
 import base64
+import gc
 import importlib.util
 import os
 import json
@@ -73,13 +74,19 @@ app.add_middleware(
 OUTPUT_DIR = Path(__file__).parent / "clips"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# This container has a hard 1GB memory ceiling (Railway Hobby plan). Demucs
-# and DeepFilterNet can each spike well past a few hundred MB on their own;
-# two of them (or one plus a concurrent clip render) running at the same
-# instant is what actually risks an OOM kill, not either one alone. This
-# lock forces the memory-heavy self-hosted tools to run one at a time per
-# replica instead of overlapping — costs some latency under concurrent
-# load, costs nothing when idle.
+# This container has a hard 1GB memory ceiling (Railway Hobby plan) — that
+# ceiling is NOT independently raisable via the API, it's tied to the plan
+# tier. Confirmed by an actual OOM kill in production logs (a bare "Killed"
+# from the kernel) during a round of manual testing that hit several AI
+# Tools back to back. Every tool on the /remove-*, /enhance-*, /generate-*,
+# /synthesize-voice, and /download-social-video endpoints now shares this
+# one lock, so at most one of them runs at a time per replica — none of
+# them individually should approach 1GB, but several running concurrently
+# (or overlapping with a real /process clip job) can stack past it. This
+# trades some latency under concurrent load for not getting silently
+# killed mid-request. If you outgrow this, the real fix is either
+# upgrading the Railway plan (raises the per-replica ceiling) or splitting
+# these tools into their own service with its own separate 1GB budget.
 HEAVY_TASK_LOCK = asyncio.Lock()
 
 # Serves finished clips at http://<host>/clips/<filename>.mp4 — without
@@ -1692,16 +1699,18 @@ async def download_social_video_endpoint(url: str = Form(...)):
     work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        try:
-            source = download_video(url, work_dir)
-        except Exception as e:
-            raise HTTPException(400, f"Could not download that video: {e}")
+        async with HEAVY_TASK_LOCK:
+            try:
+                source = download_video(url, work_dir)
+            except Exception as e:
+                raise HTTPException(400, f"Could not download that video: {e}")
 
-        out_name = f"download_{uuid.uuid4().hex[:8]}.mp4"
-        shutil.copy(source, OUTPUT_DIR / out_name)
-        return {"url": f"/clips/{out_name}", "size_bytes": (OUTPUT_DIR / out_name).stat().st_size}
+            out_name = f"download_{uuid.uuid4().hex[:8]}.mp4"
+            shutil.copy(source, OUTPUT_DIR / out_name)
+            return {"url": f"/clips/{out_name}", "size_bytes": (OUTPUT_DIR / out_name).stat().st_size}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        gc.collect()
 
 
 @app.post("/remove-background")
@@ -1870,15 +1879,17 @@ async def synthesize_voice(script: str = Form(...), voice: str = Form(DEFAULT_VO
     work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        audio_path = synthesize_voiceover(script, voice, work_dir)
-        if not audio_path:
-            raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
+        async with HEAVY_TASK_LOCK:
+            audio_path = synthesize_voiceover(script, voice, work_dir)
+            if not audio_path:
+                raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
 
-        out_name = f"voice_{uuid.uuid4().hex[:8]}{audio_path.suffix}"
-        shutil.copy(audio_path, OUTPUT_DIR / out_name)
-        return {"url": f"/clips/{out_name}"}
+            out_name = f"voice_{uuid.uuid4().hex[:8]}{audio_path.suffix}"
+            shutil.copy(audio_path, OUTPUT_DIR / out_name)
+            return {"url": f"/clips/{out_name}"}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        gc.collect()
 
 
 @app.post("/generate-image")
@@ -1894,15 +1905,33 @@ async def generate_image(prompt: str = Form(...)):
         raise HTTPException(400, "Prompt can't be empty.")
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
-                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-            )
+        async with HEAVY_TASK_LOCK:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                )
     except Exception as e:
         raise HTTPException(502, f"Could not reach the image-generation service: {e}")
+    finally:
+        gc.collect()
 
+    if resp.status_code == 429:
+        # Gemini's free tier is a small SHARED quota across every user on
+        # this site, both per-minute and per-day — a 429 here means someone
+        # (possibly several people) just used it up, not that anything is
+        # broken. Extract the suggested retry delay if Google sent one.
+        retry_after = None
+        try:
+            detail = resp.json()
+            for err in detail.get("error", {}).get("details", []):
+                if err.get("@type", "").endswith("RetryInfo"):
+                    retry_after = err.get("retryDelay")
+        except Exception:
+            pass
+        wait_msg = f" Try again in about {retry_after}." if retry_after else " Try again in a minute."
+        raise HTTPException(429, f"AI Images is rate-limited right now (this runs on a shared free quota).{wait_msg}")
     if resp.status_code != 200:
         raise HTTPException(502, f"Image generation failed ({resp.status_code}): {resp.text[-800:]}")
 
@@ -1915,6 +1944,7 @@ async def generate_image(prompt: str = Form(...)):
 
     out_name = f"image_{uuid.uuid4().hex[:8]}.png"
     (OUTPUT_DIR / out_name).write_bytes(base64.b64decode(image_b64))
+    del data, image_b64
     return {"url": f"/clips/{out_name}"}
 
 
@@ -1998,18 +2028,27 @@ async def generate_avatar_video(script: str = Form(...), image: UploadFile = Fil
         ext = ".jpg"
     photo_name = f"avatar_src_{uuid.uuid4().hex[:8]}{ext}"
     (OUTPUT_DIR / photo_name).write_bytes(raw)
+    del raw
     photo_url = f"{PIPELINE_PUBLIC_URL}/clips/{photo_name}"
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            create_resp = await client.post(
-                "https://api.d-id.com/talks",
-                headers={"Authorization": _did_auth_header(), "Content-Type": "application/json"},
-                json={"source_url": photo_url, "script": {"type": "text", "input": script}},
-            )
+        async with HEAVY_TASK_LOCK:
+            async with httpx.AsyncClient(timeout=30) as client:
+                create_resp = await client.post(
+                    "https://api.d-id.com/talks",
+                    headers={"Authorization": _did_auth_header(), "Content-Type": "application/json"},
+                    json={"source_url": photo_url, "script": {"type": "text", "input": script}},
+                )
     except Exception as e:
         raise HTTPException(502, f"Could not reach D-ID: {e}")
+    finally:
+        gc.collect()
 
+    if create_resp.status_code == 451 or "moderation" in create_resp.text.lower():
+        # D-ID's automated moderation flags a photo before generation even
+        # starts — this is a real per-photo rejection (often a false
+        # positive on ordinary photos), not something retrying fixes.
+        raise HTTPException(451, "D-ID's automatic content moderation rejected this photo — try a different, clearer photo of a face. This isn't a quota or server issue, just this specific image.")
     if create_resp.status_code not in (200, 201):
         raise HTTPException(502, f"D-ID rejected the request ({create_resp.status_code}): {create_resp.text[-500:]}")
 

@@ -1639,6 +1639,34 @@ def remove_music(job_id: str = Form(...)):
     return {"ok": True}
 
 
+@app.post("/download-social-video")
+async def download_social_video_endpoint(url: str = Form(...)):
+    """Downloads a video straight from a YouTube/TikTok/etc link — no
+    clipping, transcription, or captioning, just the raw source file, for
+    the standalone Download Social Videos tool. Reuses download_video()'s
+    existing YouTube bot-detection handling (multi-client fallback, PO
+    token, optional cookies) — those extractor-args are simply ignored by
+    yt-dlp for non-YouTube sites, so this works unmodified for TikTok and
+    anything else yt-dlp supports."""
+    url = url.strip()
+    if not url:
+        raise HTTPException(400, "Paste a video link first.")
+
+    work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            source = download_video(url, work_dir)
+        except Exception as e:
+            raise HTTPException(400, f"Could not download that video: {e}")
+
+        out_name = f"download_{uuid.uuid4().hex[:8]}.mp4"
+        shutil.copy(source, OUTPUT_DIR / out_name)
+        return {"url": f"/clips/{out_name}", "size_bytes": (OUTPUT_DIR / out_name).stat().st_size}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
     """Removes the background from an uploaded image using rembg — fully
@@ -1981,4 +2009,5 @@ def health():
         "speech_enhancer": "deepfilternet (self-hosted)" if shutil.which("deepFilter") else "unavailable",
         "ai_images": "gemini" if GEMINI_API_KEY else "not configured",
         "content_ideas": "groq" if GROQ_API_KEY else "not configured",
+        "social_video_download": "enabled",
     }

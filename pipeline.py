@@ -119,6 +119,19 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 # see synthesize_voiceover() below for why this is tried before ElevenLabs.
 GOOGLE_TTS_API_KEY = os.environ.get("GOOGLE_TTS_API_KEY")
 
+# Google AI Studio (Gemini) — same Google Cloud API-key pattern as TTS
+# above, but a separate key since it's issued from aistudio.google.com,
+# not the Cloud Console. Free tier as of this writing: several hundred
+# image-generation requests/day, no card on file — see /generate-image.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Groq — OpenAI-compatible chat completions API, free tier with no card
+# on file. Used for /brainstorm-ideas instead of Anthropic, same
+# zero-Claude-dependency philosophy as the transcript-based voiceover
+# script fallback above.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 # URL of a self-hosted bgutil-ytdlp-pot-provider instance (see
 # https://github.com/Brainicism/bgutil-ytdlp-pot-provider) — generates
 # proof-of-origin tokens that help yt-dlp's traffic look legitimate to
@@ -1770,6 +1783,118 @@ async def enhance_speech(file: UploadFile = File(...)):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@app.post("/synthesize-voice")
+async def synthesize_voice(script: str = Form(...), voice: str = Form(DEFAULT_VOICE)):
+    """Standalone text-to-speech — the same provider chain used inside the
+    clip editor (Google TTS / ElevenLabs / self-hosted Piper), but without
+    needing a job or a clip first. Powers the standalone AI Voiceovers
+    tool on the tools page."""
+    if not script.strip():
+        raise HTTPException(400, "Script can't be empty.")
+    if len(script) > 5000:
+        raise HTTPException(400, "Script is too long (5000 characters max).")
+
+    work_dir = TOOLS_DIR / uuid.uuid4().hex[:8]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        audio_path = synthesize_voiceover(script, voice, work_dir)
+        if not audio_path:
+            raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
+
+        out_name = f"voice_{uuid.uuid4().hex[:8]}{audio_path.suffix}"
+        shutil.copy(audio_path, OUTPUT_DIR / out_name)
+        return {"url": f"/clips/{out_name}"}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/generate-image")
+async def generate_image(prompt: str = Form(...)):
+    """Generates an image from a text prompt via Google's Gemini API
+    (gemini-2.5-flash-image, aka "Nano Banana") — free tier, no card on
+    file. Not self-hosted like the tools above (there's no realistic
+    free/CPU-only substitute for text-to-image), so this depends on
+    GEMINI_API_KEY being set and on Google's free-tier quota holding up."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(501, "Image generation isn't configured on this server (no GEMINI_API_KEY).")
+    if not prompt.strip():
+        raise HTTPException(400, "Prompt can't be empty.")
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach the image-generation service: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Image generation failed ({resp.status_code}): {resp.text[-800:]}")
+
+    data = resp.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        image_b64 = next(p["inlineData"]["data"] for p in parts if "inlineData" in p)
+    except (KeyError, IndexError, StopIteration):
+        raise HTTPException(502, "Image generation returned no image — the prompt may have been blocked by safety filters.")
+
+    out_name = f"image_{uuid.uuid4().hex[:8]}.png"
+    (OUTPUT_DIR / out_name).write_bytes(base64.b64decode(image_b64))
+    return {"url": f"/clips/{out_name}"}
+
+
+@app.post("/brainstorm-ideas")
+async def brainstorm_ideas(topic: str = Form(...), idea_type: str = Form("Story Video")):
+    """Generates a short list of content ideas via Groq's free-tier chat
+    API (Llama 3.3 70B) instead of Anthropic — same zero-Claude-spend
+    philosophy as the transcript-based voiceover fallback."""
+    if not GROQ_API_KEY:
+        raise HTTPException(501, "Content idea brainstorming isn't configured on this server (no GROQ_API_KEY).")
+    if not topic.strip():
+        raise HTTPException(400, "Topic can't be empty.")
+
+    system_prompt = (
+        "You generate short-form video content ideas for a creator, in the style of a "
+        f'"{idea_type}". Reply with ONLY a JSON array of 6 short idea strings — no other text, '
+        "no markdown, no numbering. Each idea should be a single punchy sentence a creator "
+        "could film today."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Topic: {topic}"},
+                    ],
+                    "temperature": 0.9,
+                },
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach the idea-generation service: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Idea generation failed ({resp.status_code}): {resp.text[-800:]}")
+
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    # Models occasionally wrap JSON in a markdown code fence despite being
+    # told not to — strip that before parsing rather than failing outright.
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    try:
+        ideas = json.loads(raw)
+        if not isinstance(ideas, list):
+            raise ValueError("not a list")
+    except Exception:
+        raise HTTPException(502, "Idea generation returned an unexpected format — try again.")
+
+    return {"ideas": [str(i) for i in ideas][:10]}
+
+
 @app.post("/regenerate-voiceover")
 def regenerate_voiceover(req: RegenerateVoiceoverRequest):
     """Re-synthesizes a clip's narration from user-edited script text,
@@ -1854,4 +1979,6 @@ def health():
         "background_remover": "rembg (self-hosted)" if rembg_remove is not None else "unavailable",
         "vocal_remover": "demucs (self-hosted)" if importlib.util.find_spec("demucs") else "unavailable",
         "speech_enhancer": "deepfilternet (self-hosted)" if shutil.which("deepFilter") else "unavailable",
+        "ai_images": "gemini" if GEMINI_API_KEY else "not configured",
+        "content_ideas": "groq" if GROQ_API_KEY else "not configured",
     }

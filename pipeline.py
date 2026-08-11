@@ -320,6 +320,10 @@ class ProcessRequest(BaseModel):
     sfx_position: str = "end"          # "start" or "end"
     typing_sound: bool = False         # ambient typing-click bed under the whole clip
     flash_intro: bool = False          # white flash-in + shutter click instead of a plain fade
+    pan_x: float = 0.5                 # 0..1, where the 9:16 crop sits horizontally (0.5=centered)
+    pan_y: float = 0.5                 # 0..1, where the 9:16 crop sits vertically (0.5=centered)
+    top_text: str = ""                 # optional pinned title/hook text at the top of the frame
+    top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
 
 
 class ReclipRequest(BaseModel):
@@ -338,6 +342,10 @@ class ReclipRequest(BaseModel):
     sfx_position: str = "end"
     typing_sound: bool = False
     flash_intro: bool = False
+    pan_x: float = 0.5
+    pan_y: float = 0.5
+    top_text: str = ""
+    top_text_colors: List[str] = []
 
 
 class RegenerateVoiceoverRequest(BaseModel):
@@ -741,8 +749,23 @@ def _ass_timestamp(t: float) -> str:
     return f"{h:d}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
+# Word colors available for the top-of-frame title/hook text (see
+# words_to_ass's top_text params below) — deliberately a small fixed
+# palette rather than a free color picker, so it always reads clearly
+# against video. ASS inline color override tags use \c&HBBGGRR& (blue-
+# green-red hex, NOT rgb order).
+TOP_TEXT_COLORS = {
+    "white": "FFFFFF",
+    "red": "0000FF",
+    "green": "00FF00",
+    "yellow": "00FFFF",
+}
+DEFAULT_TOP_TEXT_COLOR = "white"
+
+
 def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
-                  chunk_size: Optional[int] = None, caption_style: str = DEFAULT_CAPTION_STYLE):
+                  chunk_size: Optional[int] = None, caption_style: str = DEFAULT_CAPTION_STYLE,
+                  top_text: str = "", top_text_colors: Optional[List[str]] = None):
     """Writes an .ass subtitle file scoped to one clip's time range. Text
     color, font, outline weight, per-line word count, and which animation
     (if any) is used are all driven by `caption_style` (see CAPTION_STYLES)
@@ -759,6 +782,16 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
       traditionally isn't karaoke-highlighted at all).
     - "fade" styles (Minimal) fade each line in/out instead of a hard cut.
 
+    `top_text` is an optional static title/hook line pinned to the top of
+    the frame for the clip's whole duration — independent of the spoken
+    captions above (different Style, different vertical position, no
+    karaoke timing since it isn't tied to speech). `top_text_colors` is a
+    list of colors (see TOP_TEXT_COLORS) matched to top_text's words by
+    index — words past the end of the list, or an unrecognized color,
+    fall back to white. This reuses the SAME libass burn-in pass as the
+    spoken captions (one extra Dialogue line in the same .ass file) rather
+    than a second ffmpeg filter stage, so it's effectively free.
+
     PlayResX/Y match the 1080x1920 output frame so font sizes and margins
     line up correctly after the crop+scale filter runs.
     """
@@ -770,6 +803,9 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
 
     # Colours are &HAABBGGRR. Outline/Shadow/Bold/Fontname/Fontsize all
     # come from the selected style so each preset actually looks distinct.
+    # The second Style (TopText) is for the optional pinned title line —
+    # Alignment 8 = top-center, MarginV 70 keeps it clear of the very top
+    # edge/notch area on most phones.
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -792,10 +828,27 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Karaoke,{style['font']},{style['size']},{style['primary']},{style['secondary']},"
         f"&H00000000,&H00000000,{style['bold']},0,0,0,100,100,0,0,1,{style['outline']},"
-        f"{style['shadow']},2,60,60,190,1\n\n"
+        f"{style['shadow']},2,60,60,190,1\n"
+        "Style: TopText,Liberation Sans Bold,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        "1,0,0,0,100,100,0,0,1,4,1,8,50,50,70,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+
+    top_words = top_text.strip().split() if top_text and top_text.strip() else []
+    if top_words:
+        colors = top_text_colors or []
+        runs = []
+        for i, w in enumerate(top_words):
+            color = colors[i] if i < len(colors) else DEFAULT_TOP_TEXT_COLOR
+            hexcode = TOP_TEXT_COLORS.get(color, TOP_TEXT_COLORS[DEFAULT_TOP_TEXT_COLOR])
+            runs.append(f"{{\\c&H{hexcode}&}}{w}")
+        top_line = (
+            f"Dialogue: 1,{_ass_timestamp(0)},{_ass_timestamp(clip_end - clip_start)},"
+            f"TopText,,0,0,0,,{' '.join(runs)}\n"
+        )
+    else:
+        top_line = ""
 
     # group into on-screen lines of `chunk_size` words each
     chunks = [clip_words[i:i + chunk_size] for i in range(0, len(clip_words), chunk_size)]
@@ -805,7 +858,7 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
                       # overflow its row, on top of the WrapStyle fix above
     FADE_MS = 150    # in/out fade duration for "fade"-style presets
 
-    lines = [header]
+    lines = [header, top_line]
     for chunk in chunks:
         if not chunk:
             continue
@@ -895,7 +948,8 @@ def _color_grade_filter(preset: str) -> str:
 
 
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
-                     zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False):
+                     zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False,
+                     pan_x: float = 0.5, pan_y: float = 0.5):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
     and/or a color grading preset, burns in the animated karaoke captions,
     and adds a short automatic fade-in/fade-out on every clip — all via
@@ -925,8 +979,19 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     fade_d = max(0.0, min(0.3, duration / 6))
     fade_color = "white" if flash_intro else "black"
 
+    # pan_x/pan_y (0..1, default 0.5=centered) let the caller shift WHERE
+    # the 9:16 crop window sits over the source frame instead of always
+    # centering it — e.g. a wide shot where the subject is off to one
+    # side. 0=left/top edge of the crop window, 1=right/bottom edge.
+    # Clamped defensively since this ultimately comes from user input via
+    # the API. crop's x/y expressions can reference out_w/out_h (the
+    # crop's own resulting width/height), which is what lets this replace
+    # crop's default centered position with an arbitrary one.
+    pan_x = max(0.0, min(1.0, pan_x))
+    pan_y = max(0.0, min(1.0, pan_y))
     vf_stages = [
-        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'",
+        f"crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':"
+        f"x='(in_w-out_w)*{pan_x:.4f}':y='(in_h-out_h)*{pan_y:.4f}'",
         "scale=1080:1920",
     ]
     if zoom_pan:
@@ -1576,6 +1641,7 @@ def _default_opts() -> dict:
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
+        pan_x=0.5, pan_y=0.5, top_text="", top_text_colors=[],
     )
 
 
@@ -1620,7 +1686,8 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
     clips = []
     for i, h in enumerate(highlights):
         ass_path = job_dir / f"clip_{i}.ass"
-        words_to_ass(words, h["start"], h["end"], ass_path, caption_style=opts["caption_style"])
+        words_to_ass(words, h["start"], h["end"], ass_path, caption_style=opts["caption_style"],
+                     top_text=opts.get("top_text", ""), top_text_colors=opts.get("top_text_colors", []))
 
         out_name = f"{job_id}_{i}.mp4"
         out_path = OUTPUT_DIR / out_name
@@ -1628,7 +1695,8 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
         try:
             cut_and_caption(source, h["start"], h["end"], ass_path, out_path,
                              zoom_pan=opts["zoom_pan"], color_preset=opts["color_preset"],
-                             flash_intro=opts["flash_intro"])
+                             flash_intro=opts["flash_intro"],
+                             pan_x=opts.get("pan_x", 0.5), pan_y=opts.get("pan_y", 0.5))
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
@@ -1703,7 +1771,8 @@ async def process(req: ProcessRequest):
             voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
             zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
             sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
-            flash_intro=req.flash_intro,
+            flash_intro=req.flash_intro, pan_x=req.pan_x, pan_y=req.pan_y,
+            top_text=req.top_text, top_text_colors=req.top_text_colors,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
                                 opts, req.url)
@@ -1731,6 +1800,11 @@ async def process_upload(
     sfx_position: str = Form("end"),
     typing_sound: bool = Form(False),
     flash_intro: bool = Form(False),
+    pan_x: float = Form(0.5),
+    pan_y: float = Form(0.5),
+    top_text: str = Form(""),
+    top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
+                                       # forms don't carry real arrays, unlike the JSON endpoints
 ):
     """Same pipeline as /process, but for a video the user uploads directly
     instead of a YouTube/Twitch/etc URL — skips yt-dlp entirely, so this
@@ -1768,7 +1842,8 @@ async def process_upload(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
-        flash_intro=flash_intro,
+        flash_intro=flash_intro, pan_x=pan_x, pan_y=pan_y, top_text=top_text,
+        top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
     )
     # See /process above — same memory-safety lock around the actual
     # transcription/render/voiceover/mix work, not the upload itself.
@@ -1806,7 +1881,8 @@ async def reclip(req: ReclipRequest):
         start, end = picks[0]["start"], picks[0]["end"]
 
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
-    words_to_ass(words, start, end, ass_path, caption_style=req.caption_style)
+    words_to_ass(words, start, end, ass_path, caption_style=req.caption_style,
+                 top_text=req.top_text, top_text_colors=req.top_text_colors)
 
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name
@@ -1817,7 +1893,8 @@ async def reclip(req: ReclipRequest):
     async with HEAVY_TASK_LOCK:
         try:
             cut_and_caption(source, start, end, ass_path, out_path,
-                             zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro)
+                             zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
+                             pan_x=req.pan_x, pan_y=req.pan_y)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 

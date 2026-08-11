@@ -933,7 +933,17 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
            "-vf", vf]
     if af:
         cmd += ["-af", af]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+    # -pix_fmt yuv420p: without this, ffmpeg inherits whatever chroma
+    # subsampling the SOURCE video uses. Some uploaded files (certain screen
+    # recordings/exports) are natively 4:4:4 — libx264 then encodes in "High
+    # 4:4:4 Predictive" profile, which takes roughly double the memory of
+    # standard 4:2:0 and was very likely what pushed a single render over
+    # this container's 1GB ceiling (confirmed via a real "Killed" kernel
+    # log line right after a 4:4:4 encode). 4:2:0 is also what almost every
+    # platform (TikTok, Instagram, etc) and player actually expects — 4:4:4
+    # output isn't reliably compatible anyway, so this is a strict
+    # improvement, not just a memory workaround.
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p",
             "-c:a", "aac", str(out_path.resolve())]
     result = subprocess.run(
         cmd,

@@ -20,6 +20,7 @@ import gc
 import importlib.util
 import os
 import json
+import random
 import re
 import shutil
 import subprocess
@@ -354,6 +355,11 @@ class SfxPlacement(BaseModel):
 class ApplySoundEffectsRequest(BaseModel):
     clip_file: str                          # the "file" value from a previous clip response
     placements: List[SfxPlacement] = []     # empty list = strip effects back to the clean track
+
+
+class ApplyGameplayBgRequest(BaseModel):
+    clip_file: str
+    enabled: bool   # True = composite the job's uploaded gameplay clip in; False = revert to the plain clip
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1341,81 @@ def find_bg_music(job_dir: Path) -> Optional[Path]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Split-screen gameplay background — the "Subway Surfers on the bottom
+# half" retention/anti-shadowban trick. Same one-upload-per-job pattern as
+# background music above: the user uploads a gameplay clip once (their own
+# recording — this app has no opinion on where it comes from, and doesn't
+# ship or fetch any game footage itself), it's stored alongside the job,
+# and it's an explicit opt-in per clip via /apply-gameplay-bg rather than
+# something baked into every render automatically.
+# ---------------------------------------------------------------------------
+GAMEPLAY_BG_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".m4v")
+
+
+def find_gameplay_bg(job_dir: Path) -> Optional[Path]:
+    for ext in GAMEPLAY_BG_EXTS:
+        candidate = job_dir / f"gameplaybg{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool:
+    """Composites the clip into the TOP half of the frame and a random
+    segment of the gameplay footage into the BOTTOM half — the finished
+    clip's own audio (speech/voiceover/sfx/music, whatever's already
+    mixed in) is kept as-is; the gameplay footage is always muted so it
+    never competes with it. A random start offset into the background
+    footage (looped if it's shorter than the clip) means the same
+    uploaded gameplay file doesn't look identical on every clip that uses
+    it. Re-encodes video (this is a real composite, not a stream copy),
+    but it's still just one ffmpeg pass over an already-finished clip —
+    no re-transcription, re-captioning, or re-cutting involved."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path.resolve())],
+            capture_output=True, text=True,
+        )
+        clip_duration = float(probe.stdout.strip() or 0) or 1.0
+    except Exception:
+        clip_duration = 1.0
+
+    try:
+        probe_bg = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(bg_path.resolve())],
+            capture_output=True, text=True,
+        )
+        bg_duration = float(probe_bg.stdout.strip() or 0) or clip_duration
+    except Exception:
+        bg_duration = clip_duration
+
+    max_start = max(0.0, bg_duration - clip_duration)
+    bg_start = random.uniform(0, max_start) if max_start > 0 else 0.0
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(clip_path.resolve()),
+        "-ss", f"{bg_start:.2f}", "-stream_loop", "-1", "-i", str(bg_path.resolve()),
+        "-filter_complex",
+        "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];"
+        "[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bot];"
+        "[top][bot]vstack=inputs=2[v]",
+        "-map", "[v]", "-map", "0:a?",
+        "-t", f"{clip_duration:.2f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest",
+        str(out_path.resolve()),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Gameplay split-screen composite failed: {result.stderr[-1500:]}")
+        return False
+    return True
+
+
 def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: str, sfx_position: str,
                         typing_sound: bool, bg_music_path: Optional[Path]) -> bool:
     """Layers an optional one-shot sound effect, an ambient typing-click
@@ -1750,6 +1831,12 @@ async def apply_sound_effects(req: ApplySoundEffectsRequest):
     if not req.placements:
         async with HEAVY_TASK_LOCK:
             shutil.copyfile(orig_path, clip_path)
+        # This endpoint just overwrote clip_path — /apply-gameplay-bg's own
+        # "clean" baseline (clip.novideobg.mp4) would now be stale if it
+        # predates this change, so drop it and let it re-snapshot fresh
+        # next time that feature is touched. See the matching comment in
+        # /apply-gameplay-bg for why both directions do this.
+        clip_path.with_suffix(".novideobg.mp4").unlink(missing_ok=True)
         return {"file": req.clip_file, "url": f"/clips/{req.clip_file}"}
 
     resolved = []
@@ -1766,7 +1853,65 @@ async def apply_sound_effects(req: ApplySoundEffectsRequest):
             raise HTTPException(500, "Failed to mix sound effects into the clip.")
         out_tmp.replace(clip_path)
 
+    clip_path.with_suffix(".novideobg.mp4").unlink(missing_ok=True)
     return {"file": req.clip_file, "url": f"/clips/{req.clip_file}"}
+
+
+@app.post("/apply-gameplay-bg")
+async def apply_gameplay_bg(req: ApplyGameplayBgRequest):
+    """Toggles the split-screen gameplay background on or off for an
+    already-rendered clip — the fast path behind the editor's "Background
+    gameplay" checkbox. Like /apply-sound-effects, this works on the
+    finished clip directly instead of going through a full /reclip
+    render: no re-cut, re-caption, or re-voiceover, just one ffmpeg
+    composite pass (see apply_gameplay_split above).
+
+    The first call for a given clip stashes a copy of its then-current
+    state as clip.novideobg.mp4 ("no video background") — every later
+    call, on or off, works from that same clean baseline, so toggling
+    back and forth never stacks split-screens on split-screens or loses
+    the original framing. enabled=false just restores that baseline.
+
+    Requires a gameplay background already uploaded for this job via
+    /upload-gameplay-bg — this is deliberately never automatic or
+    on-by-default; it's an explicit per-clip opt-in."""
+    clip_path = OUTPUT_DIR / req.clip_file
+    if not clip_path.exists():
+        raise HTTPException(404, "That clip no longer exists on the server.")
+
+    base_path = clip_path.with_suffix(".novideobg.mp4")
+    if not base_path.exists():
+        shutil.copyfile(clip_path, base_path)
+
+    if not req.enabled:
+        async with HEAVY_TASK_LOCK:
+            shutil.copyfile(base_path, clip_path)
+        # Mirror of the invalidation in /apply-sound-effects — this
+        # endpoint just overwrote clip_path, so the sfx feature's own
+        # baseline needs to re-snapshot fresh next time it's used too.
+        clip_path.with_suffix(".orig.mp4").unlink(missing_ok=True)
+        return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "gameplay_bg_enabled": False}
+
+    # Gameplay backgrounds are stored per JOB, not per clip, but this
+    # endpoint only receives a clip_file — job_id isn't threaded through
+    # OUTPUT_DIR filenames the way it is for job_dir, so it's parsed off
+    # the front of the clip filename (same "{job_id}_{suffix}.mp4" naming
+    # every clip is already given in _process_source/reclip).
+    job_id = req.clip_file.split("_")[0]
+    job_dir = JOBS_DIR / job_id
+    bg_path = find_gameplay_bg(job_dir) if job_dir.exists() else None
+    if not bg_path:
+        raise HTTPException(400, "No gameplay background uploaded for this project yet — upload one first.")
+
+    out_tmp = clip_path.with_suffix(".gpbg.mp4")
+    async with HEAVY_TASK_LOCK:
+        ok = apply_gameplay_split(base_path, out_tmp, bg_path)
+        if not ok:
+            raise HTTPException(500, "Failed to composite the gameplay background onto this clip.")
+        out_tmp.replace(clip_path)
+
+    clip_path.with_suffix(".orig.mp4").unlink(missing_ok=True)
+    return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "gameplay_bg_enabled": True}
 
 
 # Upload size cap for background music — generous for a compressed audio
@@ -1827,6 +1972,72 @@ def remove_music(job_id: str = Form(...)):
     render with no music mixed in again."""
     job_dir = JOBS_DIR / job_id
     for old in job_dir.glob("bgmusic.*"):
+        old.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+# Upload size cap for a gameplay background clip — video, so a much
+# bigger allowance than background music. Generous enough for a couple
+# minutes of 1080p footage; the split-screen composite only ever uses as
+# much of it as the current clip's own length anyway (see
+# apply_gameplay_split's random-start-offset + loop logic).
+GAMEPLAY_BG_MAX_BYTES = 300 * 1024 * 1024
+
+
+@app.post("/upload-gameplay-bg")
+async def upload_gameplay_bg(job_id: str = Form(...), file: UploadFile = File(...)):
+    """Saves a user-uploaded gameplay clip (Subway Surfers, an obby, etc.)
+    for the split-screen background feature — this app doesn't ship or
+    fetch any gameplay footage itself, it's entirely whatever the user
+    provides. Stored once per job as job_dir/gameplaybg.<ext> (see
+    find_gameplay_bg), reused by /apply-gameplay-bg for every clip in the
+    job. Uploading a new file here just replaces the old one; it doesn't
+    enable the split-screen effect on anything by itself — that's a
+    separate, explicit opt-in per clip."""
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(404, "This session has expired — generate a clip again first.")
+
+    for old in job_dir.glob("gameplaybg.*"):
+        old.unlink(missing_ok=True)
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in GAMEPLAY_BG_EXTS:
+        ext = ".mp4"
+    dest = job_dir / f"gameplaybg{ext}"
+    size = 0
+    try:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > GAMEPLAY_BG_MAX_BYTES:
+                    raise HTTPException(413, "Gameplay clip is too large (300MB max).")
+                f.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read uploaded file: {e}")
+
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    return {"ok": True}
+
+
+@app.post("/remove-gameplay-bg")
+def remove_gameplay_bg(job_id: str = Form(...)):
+    """Deletes a job's uploaded gameplay clip. Doesn't touch any clip
+    that already has the split-screen effect applied — remove it from an
+    individual clip first via /apply-gameplay-bg (enabled=false) if
+    needed."""
+    job_dir = JOBS_DIR / job_id
+    for old in job_dir.glob("gameplaybg.*"):
         old.unlink(missing_ok=True)
     return {"ok": True}
 
@@ -2285,13 +2496,14 @@ def regenerate_voiceover(req: RegenerateVoiceoverRequest):
         raise HTTPException(500, "Failed to combine the new narration with the clip.")
     muxed.replace(clip_path)
 
-    # /apply-sound-effects caches a "clean" audio baseline (clip.orig.mp4)
-    # the first time effects are placed on this clip, and re-mixes from
-    # that baseline on every subsequent placement change. That baseline is
-    # now stale (it predates this new narration) — drop it so the next
-    # sound-effect placement re-snapshots fresh audio (with the new
-    # voice-over included) instead of silently reverting to the old one.
+    # /apply-sound-effects and /apply-gameplay-bg each cache a "clean"
+    # baseline the first time they're used on a clip, and work from that
+    # baseline on every later toggle. Both are now stale (they predate
+    # this new narration) — drop them so whichever is touched next
+    # re-snapshots fresh audio (with the new voice-over included) instead
+    # of silently reverting to the old one.
     clip_path.with_suffix(".orig.mp4").unlink(missing_ok=True)
+    clip_path.with_suffix(".novideobg.mp4").unlink(missing_ok=True)
 
     return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "voiceover_script": req.script, "has_voiceover": True}
 

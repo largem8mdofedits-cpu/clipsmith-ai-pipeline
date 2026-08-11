@@ -288,12 +288,19 @@ VOICEOVER_STYLES = {
 }
 DEFAULT_VOICEOVER_STYLE = "narration"
 
-# Synthesized (not licensed/downloaded) sound effects — generated once via
-# ffmpeg's lavfi audio sources and cached to disk, so there's no external
-# provider, API key, or copyright question involved.
-SOUND_EFFECTS = ["none", "ting", "pop", "whoosh", "click"]
+# Real, user-provided sound effect clips committed under sfx/ (see repo) —
+# these replaced the earlier synthesized (ffmpeg lavfi) placeholders.
+# "none" stays in the list only for the legacy one-shot ProcessRequest/
+# ReclipRequest.sfx field below (unused by the new timeline placement UI,
+# kept for backward compatibility) so "no effect" is still a valid value there.
+SOUND_EFFECTS = ["none", "ting", "pop", "whoosh", "click", "keyboard"]
 SFX_DIR = Path(__file__).parent / "sfx"
 SFX_DIR.mkdir(exist_ok=True)
+
+# Hard cap on how many sound-effect placements one /apply-sound-effects call
+# will accept — generous for any real editing session, just a guard against
+# an absurd/malformed request building a giant ffmpeg command.
+MAX_SFX_PLACEMENTS = 60
 
 
 class ProcessRequest(BaseModel):
@@ -337,6 +344,16 @@ class RegenerateVoiceoverRequest(BaseModel):
     clip_file: str        # the "file" value from a previous clip response, e.g. "70b799b2_0.mp4"
     script: str            # user-edited narration text
     voice: str = DEFAULT_VOICE
+
+
+class SfxPlacement(BaseModel):
+    effect: str    # one of SOUND_EFFECTS, e.g. "whoosh" — never "none" here
+    time: float    # seconds from the clip's start where this effect should start playing
+
+
+class ApplySoundEffectsRequest(BaseModel):
+    clip_file: str                          # the "file" value from a previous clip response
+    placements: List[SfxPlacement] = []     # empty list = strip effects back to the clean track
 
 
 # ---------------------------------------------------------------------------
@@ -1252,39 +1269,29 @@ def apply_voiceover_if_wanted(source: Path, job_dir: Path, out_path: Path, start
 # all layered onto the clip's existing audio (original speech or AI
 # narration, whichever came out of the steps above) as a final mix pass.
 # ---------------------------------------------------------------------------
+SFX_FILE_EXTS = (".mp3", ".wav", ".m4a", ".ogg")
+
+
 def _ensure_sfx(name: str) -> Optional[Path]:
-    """Synthesizes (once, then caches to disk) a short sound effect purely
-    via ffmpeg's lavfi audio sources — no external provider, download, or
-    licensing question involved, since nothing is downloaded or sampled
-    from anywhere. Returns None for "none"/unknown names or on synth
-    failure (caller treats that as "skip the effect", never an error)."""
+    """Resolves a sound effect name to its audio file. These are real
+    clips committed under sfx/ in the repo (whoosh/click/pop/ting/
+    keyboard) rather than synthesized. Matches case-insensitively (e.g.
+    "Whoosh.mp3" or "WHOOSH.MP3" both resolve to "whoosh") since these
+    were hand-uploaded via GitHub's web UI and Railway's Linux containers
+    are case-sensitive on disk — without this, a capitalized filename
+    would silently fail to match and the effect would just no-op. Returns
+    None for "none"/unknown names, or if no matching asset exists in this
+    deploy (caller treats that as "skip the effect", never a hard error)."""
     if not name or name == "none" or name not in SOUND_EFFECTS:
         return None
-    path = SFX_DIR / f"{name}.wav"
-    if path.exists():
-        return path
-    filters = {
-        "ting": "sine=frequency=1400:duration=0.35,afade=t=out:st=0.05:d=0.3,volume=0.9",
-        "pop": "anoisesrc=d=0.12:c=pink:a=0.9,bandpass=f=300:width_type=h:w=200,afade=t=out:st=0:d=0.12,volume=1.4",
-        "whoosh": "anoisesrc=d=0.4:c=white:a=0.6,bandpass=f=1500:width_type=h:w=1800,"
-                  "afade=t=in:st=0:d=0.08,afade=t=out:st=0.2:d=0.2,volume=0.8",
-        "click": "sine=frequency=2800:duration=0.035,afade=t=out:st=0:d=0.03,volume=0.5",
-    }
-    filt = filters.get(name)
-    if not filt:
+    if not SFX_DIR.exists():
         return None
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", filt, "-ar", "44100", str(path)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not path.exists():
-            print(f"SFX synth failed for {name}: {result.stderr[-400:]}")
-            return None
-        return path
-    except Exception as e:
-        print(f"SFX synth error for {name}: {e}")
-        return None
+    name_lower = name.lower()
+    for f in SFX_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in SFX_FILE_EXTS and f.stem.lower() == name_lower:
+            return f
+    print(f"SFX asset missing for '{name}' — expected a file like {SFX_DIR}/{name}.mp3 (any case)")
+    return None
 
 
 def _ensure_typing_loop() -> Optional[Path]:
@@ -1389,6 +1396,47 @@ def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: st
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Audio extras mix failed: {result.stderr[-1500:]}")
+        return False
+    return True
+
+
+def _mix_sfx_placements(clip_path: Path, out_path: Path, placements: List[tuple]) -> bool:
+    """Mixes N sound-effect files into clip_path's existing audio track,
+    each one starting at its own timestamp (via adelay) — the fast path
+    behind the timeline editor's click-to-place sound effects. The video
+    stream is never touched (`-c:v copy`), so this runs in roughly the
+    time it takes to read+remux the audio, regardless of clip length or
+    how many effects are placed — no re-cut, re-caption, or re-encode.
+    `placements` is a list of (sfx_file_path, start_seconds) tuples,
+    already resolved/validated by the caller. A placement past the
+    clip's own duration just gets silently cut off by `duration=first`
+    below (amix follows the original track's length), not an error."""
+    input_args = ["-i", str(clip_path.resolve())]
+    filter_parts = ["[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0]"]
+    mix_labels = ["[a0]"]
+    for idx, (sfx_path, when) in enumerate(placements, start=1):
+        input_args += ["-i", str(sfx_path.resolve())]
+        delay_ms = max(0, int(when * 1000))
+        filter_parts.append(
+            f"[{idx}:a]adelay=delays={delay_ms}:all=1,"
+            f"aformat=sample_rates=44100:channel_layouts=stereo[a{idx}]"
+        )
+        mix_labels.append(f"[a{idx}]")
+
+    filter_parts.append(
+        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0[aout]"
+    )
+    filter_complex = ";".join(filter_parts)
+
+    cmd = ["ffmpeg", "-y"] + input_args + [
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-shortest",
+        str(out_path.resolve()),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"SFX placement mix failed: {result.stderr[-1500:]}")
         return False
     return True
 
@@ -1669,6 +1717,56 @@ async def reclip(req: ReclipRequest):
         "has_voiceover": voiceover_script is not None,
         "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
     }
+
+
+@app.post("/apply-sound-effects")
+async def apply_sound_effects(req: ApplySoundEffectsRequest):
+    """Stamps one or more sound effects onto an already-rendered clip's
+    audio track at specific timestamps — the fast path behind the
+    editor's timeline: click a sound effect, click anywhere on the
+    timeline to drop it (as many times, with as many different effects,
+    as wanted). This does NOT re-cut, re-caption, or re-run voiceover —
+    only the audio track is touched (`-c:v copy` in _mix_sfx_placements),
+    so it's quick regardless of clip length, unlike /reclip which is a
+    full re-render.
+
+    The first call for a given clip stashes a copy of its then-current
+    audio as clip.orig.mp4 — every call after that (including ones that
+    change or remove placements) re-mixes from that clean baseline
+    instead of layering onto whatever the previous mix left behind, so
+    the timeline's placements always fully REPLACE the clip's effects,
+    never stack on top of earlier ones. Passing an empty placements list
+    restores that clean baseline (i.e. "remove all sound effects")."""
+    clip_path = OUTPUT_DIR / req.clip_file
+    if not clip_path.exists():
+        raise HTTPException(404, "That clip no longer exists on the server.")
+    if len(req.placements) > MAX_SFX_PLACEMENTS:
+        raise HTTPException(400, f"Too many sound effects at once (max {MAX_SFX_PLACEMENTS}).")
+
+    orig_path = clip_path.with_suffix(".orig.mp4")
+    if not orig_path.exists():
+        shutil.copyfile(clip_path, orig_path)
+
+    if not req.placements:
+        async with HEAVY_TASK_LOCK:
+            shutil.copyfile(orig_path, clip_path)
+        return {"file": req.clip_file, "url": f"/clips/{req.clip_file}"}
+
+    resolved = []
+    for p in req.placements:
+        sfx_path = _ensure_sfx(p.effect)
+        if not sfx_path:
+            raise HTTPException(400, f"Unknown or unavailable sound effect: {p.effect}")
+        resolved.append((sfx_path, max(0.0, p.time)))
+
+    out_tmp = clip_path.with_suffix(".sfxmix.mp4")
+    async with HEAVY_TASK_LOCK:
+        ok = _mix_sfx_placements(orig_path, out_tmp, resolved)
+        if not ok:
+            raise HTTPException(500, "Failed to mix sound effects into the clip.")
+        out_tmp.replace(clip_path)
+
+    return {"file": req.clip_file, "url": f"/clips/{req.clip_file}"}
 
 
 # Upload size cap for background music — generous for a compressed audio
@@ -2186,6 +2284,14 @@ def regenerate_voiceover(req: RegenerateVoiceoverRequest):
     if not mux_voiceover(clip_path, vo_audio, muxed):
         raise HTTPException(500, "Failed to combine the new narration with the clip.")
     muxed.replace(clip_path)
+
+    # /apply-sound-effects caches a "clean" audio baseline (clip.orig.mp4)
+    # the first time effects are placed on this clip, and re-mixes from
+    # that baseline on every subsequent placement change. That baseline is
+    # now stale (it predates this new narration) — drop it so the next
+    # sound-effect placement re-snapshots fresh audio (with the new
+    # voice-over included) instead of silently reverting to the old one.
+    clip_path.with_suffix(".orig.mp4").unlink(missing_ok=True)
 
     return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "voiceover_script": req.script, "has_voiceover": True}
 

@@ -251,7 +251,11 @@ DEFAULT_VOICE = "Rachel"
 # One-click color grading presets, applied at render time via ffmpeg's eq/
 # colorbalance/hue filters — no separate render pass, just extra filter
 # chain stages before the caption burn-in.
-COLOR_PRESETS = ["none", "warm", "moody", "vibrant", "bw", "cinematic"]
+COLOR_PRESETS = [
+    "none", "warm", "moody", "vibrant", "bw", "cinematic",
+    # Paid-plan-only (see PREMIUM_COLOR_PRESETS below).
+    "teal_orange", "vintage", "noir", "pastel", "dreamy",
+]
 
 # Caption text-style presets — each controls font, size, color, outline
 # weight, per-word chunk size, and whether the pop-bounce/karaoke-color
@@ -265,8 +269,30 @@ CAPTION_STYLES = {
                  outline=7, shadow=0, bold=1, pop=False, karaoke=False, fade=False, chunk_size=3),
     "minimal": dict(font="Liberation Sans", size=58, primary="&H00FFFFFF", secondary="&H00DDDDDD",
                      outline=2, shadow=0, bold=0, pop=False, karaoke=False, fade=True, chunk_size=6),
+    # ---- Paid-plan-only styles (gated in the frontend, see PREMIUM_
+    # markers on index.html's style-cards) — same rendering engine as the
+    # free styles above, just different font/color/animation combos, so
+    # there's no extra server cost either way. ----
+    "neon": dict(font="Liberation Sans Bold", size=78, primary="&H00FF00FF", secondary="&H00FFFF00",
+                 outline=6, shadow=2, bold=1, pop=True, karaoke=True, fade=False, chunk_size=4),
+    "royal": dict(font="Liberation Sans Bold", size=76, primary="&H0000D7FF", secondary="&H00FFFFFF",
+                  outline=5, shadow=2, bold=1, pop=False, karaoke=True, fade=False, chunk_size=5),
+    "typewriter": dict(font="Liberation Mono Bold", size=70, primary="&H00FFFFFF", secondary="&H00FFFFFF",
+                        outline=4, shadow=1, bold=1, pop=False, karaoke=False, fade=False, chunk_size=1),
+    "shadow": dict(font="Liberation Sans Bold", size=82, primary="&H00FFFFFF", secondary="&H00FFFFFF",
+                   outline=0, shadow=6, bold=1, pop=False, karaoke=False, fade=True, chunk_size=4),
+    "impact": dict(font="Liberation Sans Bold", size=92, primary="&H00FFFFFF", secondary="&H0000FFFF",
+                   outline=8, shadow=0, bold=1, pop=True, karaoke=True, fade=False, chunk_size=3),
 }
 DEFAULT_CAPTION_STYLE = "bold"
+# Styles/presets only unlocked for paid plans — enforced in the frontend
+# (these buttons are dimmed/locked for free-plan users, see index.html);
+# the pipeline itself doesn't do auth/billing, it just renders whatever
+# style key it's given, same as every other option here. Exposed via
+# /caption-styles and /color-presets so the frontend doesn't need to keep
+# its own duplicate list in sync.
+PREMIUM_CAPTION_STYLES = {"neon", "royal", "typewriter", "shadow", "impact"}
+PREMIUM_COLOR_PRESETS = {"teal_orange", "vintage", "noir", "pastel", "dreamy"}
 
 # Voice-over tone presets — steer generate_voiceover_script()'s prompt
 # rather than changing the TTS voice actor (that's the separate `voice`
@@ -943,6 +969,17 @@ def _color_grade_filter(preset: str) -> str:
         "bw": "hue=s=0,eq=contrast=1.15",
         "cinematic": "eq=contrast=1.12:saturation=0.9:gamma=0.95,"
                      "colorbalance=rs=0.04:bs=0.06:rm=0.02:bm=0.04",
+        # ---- Paid-plan-only (see PREMIUM_COLOR_PRESETS) — same eq/
+        # colorbalance/hue building blocks as the free presets above, no
+        # external LUTs or extra ffmpeg passes, so identical render cost. ----
+        "teal_orange": "eq=contrast=1.15:saturation=1.2,"
+                        "colorbalance=rs=0.1:gs=-0.05:bs=-0.15:rm=0.08:bm=-0.1",
+        "vintage": "eq=contrast=0.95:brightness=0.03:saturation=0.7:gamma=1.05,"
+                   "colorbalance=rs=0.1:gs=0.05:bs=-0.1",
+        "noir": "hue=s=0,eq=contrast=1.3:brightness=-0.05:gamma=0.85",
+        "pastel": "eq=contrast=0.9:saturation=0.75:brightness=0.05:gamma=1.08",
+        "dreamy": "eq=contrast=0.92:saturation=0.85:brightness=0.04:gamma=1.1,"
+                  "colorbalance=rs=0.05:bs=0.05",
     }
     return presets.get(preset, "")
 
@@ -2644,12 +2681,16 @@ def list_voices():
 
 @app.get("/color-presets")
 def list_color_presets():
-    return {"presets": COLOR_PRESETS, "default": "none"}
+    return {"presets": COLOR_PRESETS, "default": "none", "premium": sorted(PREMIUM_COLOR_PRESETS)}
 
 
 @app.get("/caption-styles")
 def list_caption_styles():
-    return {"styles": list(CAPTION_STYLES.keys()), "default": DEFAULT_CAPTION_STYLE}
+    return {
+        "styles": list(CAPTION_STYLES.keys()),
+        "default": DEFAULT_CAPTION_STYLE,
+        "premium": sorted(PREMIUM_CAPTION_STYLES),
+    }
 
 
 @app.get("/voiceover-styles")

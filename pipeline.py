@@ -359,7 +359,8 @@ class ApplySoundEffectsRequest(BaseModel):
 
 class ApplyGameplayBgRequest(BaseModel):
     clip_file: str
-    enabled: bool   # True = composite the job's uploaded gameplay clip in; False = revert to the plain clip
+    enabled: bool               # True = composite a gameplay clip in; False = revert to the plain clip
+    preset: Optional[str] = None  # a name from GET /gameplay-backgrounds; omit to use the job's custom upload instead
 
 
 # ---------------------------------------------------------------------------
@@ -1343,14 +1344,45 @@ def find_bg_music(job_dir: Path) -> Optional[Path]:
 
 # ---------------------------------------------------------------------------
 # Split-screen gameplay background — the "Subway Surfers on the bottom
-# half" retention/anti-shadowban trick. Same one-upload-per-job pattern as
-# background music above: the user uploads a gameplay clip once (their own
-# recording — this app has no opinion on where it comes from, and doesn't
-# ship or fetch any game footage itself), it's stored alongside the job,
-# and it's an explicit opt-in per clip via /apply-gameplay-bg rather than
-# something baked into every render automatically.
+# half" retention/anti-shadowban trick. Two sources, either can be picked
+# per clip in /apply-gameplay-bg:
+#   1) Built-in presets — real gameplay clips committed under
+#      gameplay_bg/ in the repo (see GAMEPLAY_BG_DIR below), the same
+#      pattern as the sfx/ sound effects: whatever files are dropped in
+#      there just show up as options, no code change needed. This app
+#      doesn't record or license this footage itself — the founder
+#      sources and commits it, same as the sound effects were.
+#   2) A per-job custom upload (/upload-gameplay-bg) — for anyone who
+#      wants to use their own footage instead of a built-in preset.
+# Either way this is an explicit opt-in per clip, never automatic.
 # ---------------------------------------------------------------------------
 GAMEPLAY_BG_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".m4v")
+GAMEPLAY_BG_DIR = Path(__file__).parent / "gameplay_bg"
+GAMEPLAY_BG_DIR.mkdir(exist_ok=True)
+
+
+def list_gameplay_bg_presets() -> List[str]:
+    """Scans gameplay_bg/ for committed preset clips — returns names with
+    no extension (e.g. "minecraft_parkour"), sorted. Dynamic on purpose:
+    dropping a new file into that folder and committing it is the whole
+    process for adding a new preset, no other code changes needed."""
+    if not GAMEPLAY_BG_DIR.exists():
+        return []
+    return sorted({p.stem for p in GAMEPLAY_BG_DIR.iterdir() if p.suffix.lower() in GAMEPLAY_BG_EXTS})
+
+
+def resolve_gameplay_bg_preset(name: str) -> Optional[Path]:
+    """Case-insensitive lookup of a preset name to its file — presets get
+    hand-typed into a request body (well, picked from a frontend button,
+    but same idea as sfx names), so this is forgiving about case the same
+    way _ensure_sfx is."""
+    if not name:
+        return None
+    name_lower = name.lower()
+    for f in GAMEPLAY_BG_DIR.iterdir():
+        if f.is_file() and f.suffix.lower() in GAMEPLAY_BG_EXTS and f.stem.lower() == name_lower:
+            return f
+    return None
 
 
 def find_gameplay_bg(job_dir: Path) -> Optional[Path]:
@@ -1892,16 +1924,25 @@ async def apply_gameplay_bg(req: ApplyGameplayBgRequest):
         clip_path.with_suffix(".orig.mp4").unlink(missing_ok=True)
         return {"file": req.clip_file, "url": f"/clips/{req.clip_file}", "gameplay_bg_enabled": False}
 
+    # Two sources for the background footage: a named preset (committed
+    # to gameplay_bg/, picked from the frontend's button row — no upload
+    # needed), or the job's own custom upload if no preset was given.
     # Gameplay backgrounds are stored per JOB, not per clip, but this
     # endpoint only receives a clip_file — job_id isn't threaded through
     # OUTPUT_DIR filenames the way it is for job_dir, so it's parsed off
     # the front of the clip filename (same "{job_id}_{suffix}.mp4" naming
     # every clip is already given in _process_source/reclip).
-    job_id = req.clip_file.split("_")[0]
-    job_dir = JOBS_DIR / job_id
-    bg_path = find_gameplay_bg(job_dir) if job_dir.exists() else None
-    if not bg_path:
-        raise HTTPException(400, "No gameplay background uploaded for this project yet — upload one first.")
+    bg_path = None
+    if req.preset:
+        bg_path = resolve_gameplay_bg_preset(req.preset)
+        if not bg_path:
+            raise HTTPException(400, f"Unknown gameplay background preset: {req.preset}")
+    else:
+        job_id = req.clip_file.split("_")[0]
+        job_dir = JOBS_DIR / job_id
+        bg_path = find_gameplay_bg(job_dir) if job_dir.exists() else None
+        if not bg_path:
+            raise HTTPException(400, "No gameplay background uploaded for this project yet — pick a preset, or upload your own first.")
 
     out_tmp = clip_path.with_suffix(".gpbg.mp4")
     async with HEAVY_TASK_LOCK:
@@ -2531,6 +2572,16 @@ def list_voiceover_styles():
 @app.get("/sound-effects")
 def list_sound_effects():
     return {"effects": SOUND_EFFECTS, "default": "none"}
+
+
+@app.get("/gameplay-backgrounds")
+def list_gameplay_backgrounds():
+    """Built-in split-screen gameplay presets — whatever's currently
+    committed under gameplay_bg/ in the repo (see list_gameplay_bg_presets).
+    Purely additive to fetch: dropping a new clip in that folder and
+    committing it makes it show up here automatically, no other endpoint
+    or frontend change required."""
+    return {"presets": list_gameplay_bg_presets()}
 
 
 @app.get("/health")

@@ -1427,23 +1427,34 @@ def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool
     max_start = max(0.0, bg_duration - clip_duration)
     bg_start = random.uniform(0, max_start) if max_start > 0 else 0.0
 
+    # Same 1GB-container memory ceiling as the main render path (see notes
+    # near HEAVY_TASK_LOCK above) — this composite decodes TWO video
+    # streams at once (the clip + the gameplay footage) instead of one,
+    # so it's more memory-hungry than a normal render for the same
+    # output size. Confirmed OOM-killed in production at 1080x1920 with
+    # -preset veryfast (silent nonzero exit, no ffmpeg error text, dies
+    # right as encoding starts) — the exact same signature as the
+    # OOM documented at the top of this file. Dropping to 720x1280 and
+    # -preset ultrafast, plus capping BOTH inputs' decode threads (not
+    # just the encoder's), keeps peak memory well under the ceiling.
+    # 720x1280 is still plenty sharp for a phone screen.
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(clip_path.resolve()),
-        "-ss", f"{bg_start:.2f}", "-stream_loop", "-1", "-i", str(bg_path.resolve()),
+        "-threads", "1", "-i", str(clip_path.resolve()),
+        "-threads", "1", "-ss", f"{bg_start:.2f}", "-stream_loop", "-1", "-i", str(bg_path.resolve()),
         "-filter_complex",
-        "[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top];"
-        "[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bot];"
+        "[0:v]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];"
+        "[1:v]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bot];"
         "[top][bot]vstack=inputs=2[v]",
         "-map", "[v]", "-map", "0:a?",
         "-t", f"{clip_duration:.2f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest",
         str(out_path.resolve()),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Gameplay split-screen composite failed: {result.stderr[-1500:]}")
+        print(f"Gameplay split-screen composite failed (exit {result.returncode}): {result.stderr[-1500:]}")
         return False
     return True
 

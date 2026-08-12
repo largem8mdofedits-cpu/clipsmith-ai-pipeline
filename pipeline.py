@@ -408,8 +408,17 @@ class ProcessRequest(BaseModel):
     sfx_position: str = "end"          # "start" or "end"
     typing_sound: bool = False         # ambient typing-click bed under the whole clip
     flash_intro: bool = False          # white flash-in + shutter click instead of a plain fade
-    pan_x: float = 0.5                 # 0..1, where the 9:16 crop sits horizontally (0.5=centered)
-    pan_y: float = 0.5                 # 0..1, where the 9:16 crop sits vertically (0.5=centered)
+    # Facecam crop — cuts an arbitrary rectangle out of the SOURCE frame
+    # (fractions 0..1) and blows it up to fill the whole 1080x1920 output,
+    # instead of just cropping a centered 9:16 window. Lets someone cut a
+    # small facecam out of a corner and make IT the whole clip. crop_w<=0
+    # is the sentinel for "no manual crop" — falls back to the old
+    # default behavior (auto-centered 9:16 crop of the full frame). See
+    # cut_and_caption() below for the actual filter.
+    crop_x: float = 0.0
+    crop_y: float = 0.0
+    crop_w: float = 0.0
+    crop_h: float = 1.0
     top_text: str = ""                 # optional pinned title/hook text at the top of the frame
     top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
 
@@ -430,8 +439,10 @@ class ReclipRequest(BaseModel):
     sfx_position: str = "end"
     typing_sound: bool = False
     flash_intro: bool = False
-    pan_x: float = 0.5
-    pan_y: float = 0.5
+    crop_x: float = 0.0
+    crop_y: float = 0.0
+    crop_w: float = 0.0
+    crop_h: float = 1.0
     top_text: str = ""
     top_text_colors: List[str] = []
 
@@ -1100,7 +1111,7 @@ def _color_grade_filter(preset: str) -> str:
 
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
                      zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False,
-                     pan_x: float = 0.5, pan_y: float = 0.5):
+                     crop_x: float = 0.0, crop_y: float = 0.0, crop_w: float = 0.0, crop_h: float = 1.0):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
     and/or a color grading preset, burns in the animated karaoke captions,
     and adds a short automatic fade-in/fade-out on every clip — all via
@@ -1130,21 +1141,39 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     fade_d = max(0.0, min(0.3, duration / 6))
     fade_color = "white" if flash_intro else "black"
 
-    # pan_x/pan_y (0..1, default 0.5=centered) let the caller shift WHERE
-    # the 9:16 crop window sits over the source frame instead of always
-    # centering it — e.g. a wide shot where the subject is off to one
-    # side. 0=left/top edge of the crop window, 1=right/bottom edge.
-    # Clamped defensively since this ultimately comes from user input via
-    # the API. crop's x/y expressions can reference out_w/out_h (the
-    # crop's own resulting width/height), which is what lets this replace
-    # crop's default centered position with an arbitrary one.
-    pan_x = max(0.0, min(1.0, pan_x))
-    pan_y = max(0.0, min(1.0, pan_y))
-    vf_stages = [
-        f"crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':"
-        f"x='(in_w-out_w)*{pan_x:.4f}':y='(in_h-out_h)*{pan_y:.4f}'",
-        "scale=1080:1920",
-    ]
+    # Facecam crop — crop_w/crop_h/crop_x/crop_y (all fractions 0..1 of the
+    # SOURCE frame) let the caller cut an ARBITRARY rectangle out of the
+    # frame and blow it up to fill the whole 1080x1920 output, e.g. cutting
+    # just a facecam out of a corner and making it the entire clip. This
+    # replaced the old single-point "reposition" pan control, which could
+    # only slide a fixed 9:16 window around and couldn't target something
+    # as small as a corner facecam.
+    #
+    # crop_w<=0 is the sentinel for "no manual crop" (the default) — falls
+    # back to the previous behavior, an auto-centered 9:16 crop of the full
+    # frame, using ffmpeg's own iw/ih expressions so it adapts to whatever
+    # the source resolution actually is without Python needing to know it
+    # up front.
+    if crop_w and crop_w > 0:
+        # Manual box — clamped defensively since this ultimately comes from
+        # user input via the API. scale+crop (rather than a plain stretch)
+        # so a facecam box that isn't already 9:16 fills the frame cleanly
+        # without warping faces.
+        crop_x = max(0.0, min(1.0, crop_x))
+        crop_y = max(0.0, min(1.0, crop_y))
+        crop_w = max(0.05, min(1.0 - crop_x, crop_w))
+        crop_h = max(0.05, min(1.0 - crop_y, crop_h))
+        vf_stages = [
+            f"crop=w='iw*{crop_w:.4f}':h='ih*{crop_h:.4f}':"
+            f"x='iw*{crop_x:.4f}':y='ih*{crop_y:.4f}'",
+            "scale=1080:1920:force_original_aspect_ratio=increase",
+            "crop=1080:1920",
+        ]
+    else:
+        vf_stages = [
+            "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='(in_w-out_w)/2':y='(in_h-out_h)/2'",
+            "scale=1080:1920",
+        ]
     if zoom_pan:
         vf_stages.append(_zoompan_filter())
     if color_preset and color_preset != "none":
@@ -1183,8 +1212,19 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # platform (TikTok, Instagram, etc) and player actually expects — 4:4:4
     # output isn't reliably compatible anyway, so this is a strict
     # improvement, not just a memory workaround.
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", str(out_path.resolve())]
+    # Quality bump: previously no -crf was set at all, so libx264 fell back
+    # to its own default (23) at "veryfast", which is tuned for encode
+    # speed over compression efficiency — soft/blocky on higher-motion
+    # footage (gameplay, fast cuts). -crf 20 is a real, visible sharpness
+    # improvement (lower = higher quality/bigger file); "fast" trades a bit
+    # more encode time for noticeably better compression than "veryfast" at
+    # the same quality. This does NOT touch the levers that actually caused
+    # the OOM history above (thread count, pixel format, source resolution)
+    # — those stay exactly as fixed — so this should be a safe quality win,
+    # not a reintroduction of that risk. Bumped -b:a too since audio was
+    # left at ffmpeg's low-ish AAC default.
+    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-threads", "2", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k", str(out_path.resolve())]
     result = subprocess.run(
         cmd,
         capture_output=True, text=True,
@@ -1815,7 +1855,7 @@ def _default_opts() -> dict:
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
-        pan_x=0.5, pan_y=0.5, top_text="", top_text_colors=[],
+        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, top_text="", top_text_colors=[],
     )
 
 
@@ -1876,7 +1916,8 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
             cut_and_caption(source, h["start"], h["end"], ass_path, out_path,
                              zoom_pan=opts["zoom_pan"], color_preset=opts["color_preset"],
                              flash_intro=opts["flash_intro"],
-                             pan_x=opts.get("pan_x", 0.5), pan_y=opts.get("pan_y", 0.5))
+                             crop_x=opts.get("crop_x", 0.0), crop_y=opts.get("crop_y", 0.0),
+                             crop_w=opts.get("crop_w", 0.0), crop_h=opts.get("crop_h", 1.0))
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
@@ -1965,7 +2006,8 @@ async def process(req: ProcessRequest):
             voiceover=req.voiceover, voiceover_voice=req.voiceover_voice, voiceover_style=req.voiceover_style,
             zoom_pan=req.zoom_pan, color_preset=req.color_preset, caption_style=req.caption_style,
             sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
-            flash_intro=req.flash_intro, pan_x=req.pan_x, pan_y=req.pan_y,
+            flash_intro=req.flash_intro,
+            crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
             top_text=req.top_text, top_text_colors=req.top_text_colors,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
@@ -1994,8 +2036,10 @@ async def process_upload(
     sfx_position: str = Form("end"),
     typing_sound: bool = Form(False),
     flash_intro: bool = Form(False),
-    pan_x: float = Form(0.5),
-    pan_y: float = Form(0.5),
+    crop_x: float = Form(0.0),
+    crop_y: float = Form(0.0),
+    crop_w: float = Form(0.0),
+    crop_h: float = Form(1.0),
     top_text: str = Form(""),
     top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
                                        # forms don't carry real arrays, unlike the JSON endpoints
@@ -2036,7 +2080,8 @@ async def process_upload(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
-        flash_intro=flash_intro, pan_x=pan_x, pan_y=pan_y, top_text=top_text,
+        flash_intro=flash_intro, crop_x=crop_x, crop_y=crop_y, crop_w=crop_w, crop_h=crop_h,
+        top_text=top_text,
         top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
     )
     # See /process above — same memory-safety lock around the actual
@@ -2088,7 +2133,7 @@ async def reclip(req: ReclipRequest):
         try:
             cut_and_caption(source, start, end, ass_path, out_path,
                              zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
-                             pan_x=req.pan_x, pan_y=req.pan_y)
+                             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 

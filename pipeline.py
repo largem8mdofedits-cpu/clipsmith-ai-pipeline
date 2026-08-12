@@ -422,22 +422,36 @@ class ProcessRequest(BaseModel):
     crop_w: float = 0.0
     crop_h: float = 1.0
     # Position (0..1 each, default top-right-ish) of the facecam bubble's
-    # top-left corner within the 1080x1920 canvas — draggable, lets it be
+    # CENTER within the 1080x1920 canvas — draggable, lets it be
     # repositioned anywhere without re-selecting the crop box. Ignored when
     # no facecam is active (crop_w<=0).
-    pip_x: float = 0.65
-    pip_y: float = 0.04
+    pip_x: float = 0.8
+    pip_y: float = 0.12
+    # Size of the facecam PIP bubble as a multiple of its normal width —
+    # 1.0 is the original fixed 340px-wide bubble; draggable/scalable
+    # freely from the frontend rather than a single fixed size.
+    pip_scale: float = 1.0
     top_text: str = ""                 # optional pinned title/hook text at the top of the frame
     top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
     # Extra text properties — all default to whatever the current baked-in
     # look already was, so omitting them from a request renders identically
     # to before these existed.
-    caption_position: str = "bottom"        # "top" | "center" | "bottom" — spoken captions
     caption_uppercase: bool = False         # force ALL CAPS on spoken captions
     caption_bold: Optional[bool] = None     # None = use the caption_style's own bold; True/False overrides it
-    top_text_position: str = "top"          # "top" | "center" | "bottom" — pinned title text
     top_text_uppercase: bool = False        # force ALL CAPS on the pinned title text
     top_text_bold: bool = True              # top text has always rendered bold; toggle to turn it off
+    # Free 2D position (0..1 each, fraction of the 1080x1920 canvas) of
+    # the CENTER of each text block, draggable to anywhere in frame —
+    # replaces the earlier fixed top/center/bottom preset. Scale is a
+    # multiplier on the style's normal font size. Defaults approximate
+    # where captions/top-text always used to sit before this was
+    # adjustable (bottom-center / top-center respectively).
+    caption_x: float = 0.5
+    caption_y: float = 0.88
+    caption_scale: float = 1.0
+    top_text_x: float = 0.5
+    top_text_y: float = 0.08
+    top_text_scale: float = 1.0
 
 
 class ReclipRequest(BaseModel):
@@ -460,16 +474,21 @@ class ReclipRequest(BaseModel):
     crop_y: float = 0.0
     crop_w: float = 0.0
     crop_h: float = 1.0
-    pip_x: float = 0.65
-    pip_y: float = 0.04
+    pip_x: float = 0.8
+    pip_y: float = 0.12
+    pip_scale: float = 1.0
     top_text: str = ""
     top_text_colors: List[str] = []
-    caption_position: str = "bottom"
     caption_uppercase: bool = False
     caption_bold: Optional[bool] = None
-    top_text_position: str = "top"
     top_text_uppercase: bool = False
     top_text_bold: bool = True
+    caption_x: float = 0.5
+    caption_y: float = 0.88
+    caption_scale: float = 1.0
+    top_text_x: float = 0.5
+    top_text_y: float = 0.08
+    top_text_scale: float = 1.0
 
 
 class RegenerateVoiceoverRequest(BaseModel):
@@ -938,32 +957,18 @@ TOP_TEXT_COLORS = {
 }
 DEFAULT_TOP_TEXT_COLOR = "white"
 
-# Vertical placement presets for burned-in text — maps to (ASS Alignment,
-# MarginV). Alignment uses the numpad layout libass expects: 7/8/9=top
-# row, 4/5/6=middle row, 1/2/3=bottom row; the middle digit of each row is
-# horizontal-center, which is all every preset here uses (2/5/8). MarginV
-# is ignored by libass for the middle row, so 0 there is fine. The
-# "bottom" caption default (2, 190) and "top" top-text default (8, 70)
-# match the pixel values this function always used before positioning was
-# configurable, so leaving these unset renders pixel-identical to before.
-CAPTION_POSITIONS = {
-    "top": (8, 90),
-    "center": (5, 0),
-    "bottom": (2, 190),
-}
-TOP_TEXT_POSITIONS = {
-    "top": (8, 70),
-    "center": (5, 0),
-    "bottom": (2, 100),
-}
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
                   chunk_size: Optional[int] = None, caption_style: str = DEFAULT_CAPTION_STYLE,
                   top_text: str = "", top_text_colors: Optional[List[str]] = None,
-                  caption_position: str = "bottom", caption_uppercase: bool = False,
-                  caption_bold: Optional[bool] = None, top_text_position: str = "top",
-                  top_text_uppercase: bool = False, top_text_bold: bool = True):
+                  caption_uppercase: bool = False, caption_bold: Optional[bool] = None,
+                  top_text_uppercase: bool = False, top_text_bold: bool = True,
+                  caption_x: float = 0.5, caption_y: float = 0.88, caption_scale: float = 1.0,
+                  top_text_x: float = 0.5, top_text_y: float = 0.08, top_text_scale: float = 1.0):
     """Writes an .ass subtitle file scoped to one clip's time range. Text
     color, font, outline weight, per-line word count, and which animation
     (if any) is used are all driven by `caption_style` (see CAPTION_STYLES)
@@ -992,6 +997,17 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
 
     PlayResX/Y match the 1080x1920 output frame so font sizes and margins
     line up correctly after the crop+scale filter runs.
+
+    `caption_x`/`caption_y` (and the `top_text_*` equivalents) are free
+    0..1 fractions of the 1080x1920 canvas marking the CENTER of that
+    text block — draggable to anywhere in frame from the frontend, not
+    limited to a handful of presets. Every Dialogue line uses Alignment 5
+    (middle-center) plus an explicit ASS \\pos(x,y) override tag, which
+    together make (x,y) exactly the text's center point regardless of how
+    many characters are in that particular line — this is what lets a
+    single UI drag-pin represent the position accurately no matter what
+    the spoken words happen to be. `caption_scale`/`top_text_scale`
+    multiply the style's normal font size (1.0 = unchanged).
     """
     style = CAPTION_STYLES.get(caption_style, CAPTION_STYLES[DEFAULT_CAPTION_STYLE])
     if chunk_size is None:
@@ -1002,14 +1018,18 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
     # caption_bold=None keeps the style's own Bold field untouched (exact
     # previous behavior); True/False explicitly forces it either way.
     karaoke_bold = style["bold"] if caption_bold is None else (1 if caption_bold else 0)
+    caption_fontsize = max(10, round(style["size"] * _clamp(caption_scale, 0.4, 2.5)))
+    top_text_fontsize = max(10, round(66 * _clamp(top_text_scale, 0.4, 2.5)))
+    caption_pos = f"{{\\pos({round(_clamp(caption_x, 0.0, 1.0) * 1080)},{round(_clamp(caption_y, 0.0, 1.0) * 1920)})}}"
+    top_text_pos = f"{{\\pos({round(_clamp(top_text_x, 0.0, 1.0) * 1080)},{round(_clamp(top_text_y, 0.0, 1.0) * 1920)})}}"
     top_text_bold_field = 1 if top_text_bold else 0
-    caption_align, caption_marginv = CAPTION_POSITIONS.get(caption_position, CAPTION_POSITIONS["bottom"])
-    top_text_align, top_text_marginv = TOP_TEXT_POSITIONS.get(top_text_position, TOP_TEXT_POSITIONS["top"])
 
-    # Colours are &HAABBGGRR. Outline/Shadow/Fontname/Fontsize come from
-    # the selected style so each preset actually looks distinct; Bold and
-    # vertical placement (Alignment/MarginV) are overridable per-request
-    # via the fields above.
+    # Colours are &HAABBGGRR. Outline/Shadow/Fontname come from the
+    # selected style so each preset actually looks distinct; Fontsize is
+    # scaled per caption_fontsize/top_text_fontsize above. Alignment 5
+    # (middle-center) is fixed for BOTH styles now — actual placement
+    # comes entirely from the per-line \pos(x,y) override tags below, so
+    # MarginL/R/V are irrelevant here and just left at 0.
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -1030,11 +1050,11 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Karaoke,{style['font']},{style['size']},{style['primary']},{style['secondary']},"
+        f"Style: Karaoke,{style['font']},{caption_fontsize},{style['primary']},{style['secondary']},"
         f"&H00000000,&H00000000,{karaoke_bold},0,0,0,100,100,0,0,1,{style['outline']},"
-        f"{style['shadow']},{caption_align},60,60,{caption_marginv},1\n"
-        f"Style: TopText,Liberation Sans Bold,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
-        f"{top_text_bold_field},0,0,0,100,100,0,0,1,4,1,{top_text_align},50,50,{top_text_marginv},1\n\n"
+        f"{style['shadow']},5,0,0,0,1\n"
+        f"Style: TopText,Liberation Sans Bold,{top_text_fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        f"{top_text_bold_field},0,0,0,100,100,0,0,1,4,1,5,0,0,0,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -1051,7 +1071,7 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
             runs.append(f"{{\\c&H{hexcode}&}}{w}")
         top_line = (
             f"Dialogue: 1,{_ass_timestamp(0)},{_ass_timestamp(clip_end - clip_start)},"
-            f"TopText,,0,0,0,,{' '.join(runs)}\n"
+            f"TopText,,0,0,0,,{top_text_pos}{' '.join(runs)}\n"
         )
     else:
         top_line = ""
@@ -1083,7 +1103,7 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
             prefix = f"{{\\fad({FADE_MS},{FADE_MS})}}" if style["fade"] else ""
             lines.append(
                 f"Dialogue: 0,{_ass_timestamp(line_start)},{_ass_timestamp(line_end)},"
-                f"Karaoke,,0,0,0,,{prefix}{text}\n"
+                f"Karaoke,,0,0,0,,{caption_pos}{prefix}{text}\n"
             )
             continue
 
@@ -1118,7 +1138,7 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
 
         lines.append(
             f"Dialogue: 0,{_ass_timestamp(line_start)},{_ass_timestamp(line_end)},"
-            f"Karaoke,,0,0,0,,{karaoke_text.strip()}\n"
+            f"Karaoke,,0,0,0,,{caption_pos}{karaoke_text.strip()}\n"
         )
 
     ass_path.write_text("".join(lines), encoding="utf-8")
@@ -1172,7 +1192,7 @@ def _color_grade_filter(preset: str) -> str:
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
                      zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False,
                      crop_x: float = 0.0, crop_y: float = 0.0, crop_w: float = 0.0, crop_h: float = 1.0,
-                     pip_x: float = 0.65, pip_y: float = 0.04):
+                     pip_x: float = 0.8, pip_y: float = 0.12, pip_scale: float = 1.0):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
     and/or a color grading preset, burns in the animated karaoke captions,
     and adds a short automatic fade-in/fade-out on every clip — all via
@@ -1225,11 +1245,16 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # This does NOT replace the main clip — the main video keeps its
     # normal auto-centered 9:16 crop as the background, and the facecam
     # region is composited as a small floating bubble on top of it
-    # (picture-in-picture), draggable to any position via pip_x/pip_y
-    # (0..1, fraction of the 1080x1920 canvas — the bubble's top-left
-    # corner). An earlier version replaced the ENTIRE clip with just the
-    # blown-up facecam, which lost the original video — this is the
-    # correct standard behavior other clipping tools use.
+    # (picture-in-picture), draggable to any position via pip_x/pip_y and
+    # resizable via pip_scale. An earlier version replaced the ENTIRE clip
+    # with just the blown-up facecam, which lost the original video — this
+    # is the correct standard behavior other clipping tools use.
+    #
+    # pip_x/pip_y (0..1) are the CENTER of the bubble on the 1080x1920
+    # canvas — NOT its top-left corner — so the same "drag pin = center"
+    # model and center-snap logic used for the caption/top-text position
+    # pins applies here too. pip_scale multiplies the bubble's base width
+    # (1.0 = the original fixed 340px).
     #
     # crop_w<=0 is the sentinel for "no facecam" (the default) — falls
     # back to the plain single-layer auto-centered 9:16 crop, using
@@ -1243,7 +1268,7 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         pip_x = max(0.0, min(1.0, pip_x))
         pip_y = max(0.0, min(1.0, pip_y))
 
-        PIP_WIDTH_PX = 340   # facecam bubble width on the 1080-wide canvas
+        PIP_WIDTH_PX = max(80, round(340 * max(0.4, min(2.5, pip_scale))))  # bubble width on the 1080-wide canvas
         PIP_BORDER_PX = 4    # white border so the bubble reads as intentional, not a stray rectangle
 
         filter_complex_stages = [
@@ -1260,11 +1285,13 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
             # rounds to an even number, required for yuv420p output.
             f"scale={PIP_WIDTH_PX}:-2,"
             f"pad=iw+{PIP_BORDER_PX*2}:ih+{PIP_BORDER_PX*2}:{PIP_BORDER_PX}:{PIP_BORDER_PX}:color=white[fc]",
-            # min(main_w*pip_x, main_w-overlay_w) clamps server-side too —
-            # the bubble can never hang off the right/bottom edge even if a
-            # stale/out-of-range pip_x or pip_y ever comes through.
-            f"[bg][fc]overlay=x='min(main_w*{pip_x:.4f},main_w-overlay_w)':"
-            f"y='min(main_h*{pip_y:.4f},main_h-overlay_h)'[merged]",
+            # pip_x/pip_y are the bubble's CENTER, so subtract half its own
+            # rendered width/height to get the top-left corner ffmpeg's
+            # overlay filter actually wants — then clamp server-side so it
+            # can never hang off any edge even if a stale/out-of-range
+            # pip_x/pip_y or pip_scale ever comes through.
+            f"[bg][fc]overlay=x='max(0,min(main_w*{pip_x:.4f}-overlay_w/2,main_w-overlay_w))':"
+            f"y='max(0,min(main_h*{pip_y:.4f}-overlay_h/2,main_h-overlay_h))'[merged]",
             f"[merged]{','.join(post_stages)}[vout]",
         ]
         filter_complex = ";".join(filter_complex_stages)
@@ -1958,10 +1985,12 @@ def _default_opts() -> dict:
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
-        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, pip_x=0.65, pip_y=0.04,
+        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, pip_x=0.8, pip_y=0.12, pip_scale=1.0,
         top_text="", top_text_colors=[],
-        caption_position="bottom", caption_uppercase=False, caption_bold=None,
-        top_text_position="top", top_text_uppercase=False, top_text_bold=True,
+        caption_uppercase=False, caption_bold=None,
+        top_text_uppercase=False, top_text_bold=True,
+        caption_x=0.5, caption_y=0.88, caption_scale=1.0,
+        top_text_x=0.5, top_text_y=0.08, top_text_scale=1.0,
     )
 
 
@@ -2014,12 +2043,14 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
         ass_path = job_dir / f"clip_{i}.ass"
         words_to_ass(words, h["start"], h["end"], ass_path, caption_style=opts["caption_style"],
                      top_text=opts.get("top_text", ""), top_text_colors=opts.get("top_text_colors", []),
-                     caption_position=opts.get("caption_position", "bottom"),
                      caption_uppercase=opts.get("caption_uppercase", False),
                      caption_bold=opts.get("caption_bold", None),
-                     top_text_position=opts.get("top_text_position", "top"),
                      top_text_uppercase=opts.get("top_text_uppercase", False),
-                     top_text_bold=opts.get("top_text_bold", True))
+                     top_text_bold=opts.get("top_text_bold", True),
+                     caption_x=opts.get("caption_x", 0.5), caption_y=opts.get("caption_y", 0.88),
+                     caption_scale=opts.get("caption_scale", 1.0),
+                     top_text_x=opts.get("top_text_x", 0.5), top_text_y=opts.get("top_text_y", 0.08),
+                     top_text_scale=opts.get("top_text_scale", 1.0))
 
         out_name = f"{job_id}_{i}.mp4"
         out_path = OUTPUT_DIR / out_name
@@ -2030,7 +2061,8 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
                              flash_intro=opts["flash_intro"],
                              crop_x=opts.get("crop_x", 0.0), crop_y=opts.get("crop_y", 0.0),
                              crop_w=opts.get("crop_w", 0.0), crop_h=opts.get("crop_h", 1.0),
-                             pip_x=opts.get("pip_x", 0.65), pip_y=opts.get("pip_y", 0.04))
+                             pip_x=opts.get("pip_x", 0.8), pip_y=opts.get("pip_y", 0.12),
+                             pip_scale=opts.get("pip_scale", 1.0))
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
@@ -2121,11 +2153,12 @@ async def process(req: ProcessRequest):
             sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
             flash_intro=req.flash_intro,
             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
-            pip_x=req.pip_x, pip_y=req.pip_y,
+            pip_x=req.pip_x, pip_y=req.pip_y, pip_scale=req.pip_scale,
             top_text=req.top_text, top_text_colors=req.top_text_colors,
-            caption_position=req.caption_position, caption_uppercase=req.caption_uppercase,
-            caption_bold=req.caption_bold, top_text_position=req.top_text_position,
+            caption_uppercase=req.caption_uppercase, caption_bold=req.caption_bold,
             top_text_uppercase=req.top_text_uppercase, top_text_bold=req.top_text_bold,
+            caption_x=req.caption_x, caption_y=req.caption_y, caption_scale=req.caption_scale,
+            top_text_x=req.top_text_x, top_text_y=req.top_text_y, top_text_scale=req.top_text_scale,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
                                 opts, req.url, download_tier)
@@ -2157,17 +2190,22 @@ async def process_upload(
     crop_y: float = Form(0.0),
     crop_w: float = Form(0.0),
     crop_h: float = Form(1.0),
-    pip_x: float = Form(0.65),
-    pip_y: float = Form(0.04),
+    pip_x: float = Form(0.8),
+    pip_y: float = Form(0.12),
+    pip_scale: float = Form(1.0),
     top_text: str = Form(""),
     top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
                                        # forms don't carry real arrays, unlike the JSON endpoints
-    caption_position: str = Form("bottom"),
     caption_uppercase: bool = Form(False),
     caption_bold: Optional[bool] = Form(None),
-    top_text_position: str = Form("top"),
     top_text_uppercase: bool = Form(False),
     top_text_bold: bool = Form(True),
+    caption_x: float = Form(0.5),
+    caption_y: float = Form(0.88),
+    caption_scale: float = Form(1.0),
+    top_text_x: float = Form(0.5),
+    top_text_y: float = Form(0.08),
+    top_text_scale: float = Form(1.0),
 ):
     """Same pipeline as /process, but for a video the user uploads directly
     instead of a YouTube/Twitch/etc URL — skips yt-dlp entirely, so this
@@ -2206,11 +2244,13 @@ async def process_upload(
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
         flash_intro=flash_intro, crop_x=crop_x, crop_y=crop_y, crop_w=crop_w, crop_h=crop_h,
-        pip_x=pip_x, pip_y=pip_y,
+        pip_x=pip_x, pip_y=pip_y, pip_scale=pip_scale,
         top_text=top_text,
         top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
-        caption_position=caption_position, caption_uppercase=caption_uppercase, caption_bold=caption_bold,
-        top_text_position=top_text_position, top_text_uppercase=top_text_uppercase, top_text_bold=top_text_bold,
+        caption_uppercase=caption_uppercase, caption_bold=caption_bold,
+        top_text_uppercase=top_text_uppercase, top_text_bold=top_text_bold,
+        caption_x=caption_x, caption_y=caption_y, caption_scale=caption_scale,
+        top_text_x=top_text_x, top_text_y=top_text_y, top_text_scale=top_text_scale,
     )
     # See /process above — same memory-safety lock around the actual
     # transcription/render/voiceover/mix work, not the upload itself.
@@ -2273,9 +2313,10 @@ async def reclip(req: ReclipRequest):
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
     words_to_ass(words, start, end, ass_path, caption_style=req.caption_style,
                  top_text=req.top_text, top_text_colors=req.top_text_colors,
-                 caption_position=req.caption_position, caption_uppercase=req.caption_uppercase,
-                 caption_bold=req.caption_bold, top_text_position=req.top_text_position,
-                 top_text_uppercase=req.top_text_uppercase, top_text_bold=req.top_text_bold)
+                 caption_uppercase=req.caption_uppercase, caption_bold=req.caption_bold,
+                 top_text_uppercase=req.top_text_uppercase, top_text_bold=req.top_text_bold,
+                 caption_x=req.caption_x, caption_y=req.caption_y, caption_scale=req.caption_scale,
+                 top_text_x=req.top_text_x, top_text_y=req.top_text_y, top_text_scale=req.top_text_scale)
 
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name
@@ -2288,7 +2329,7 @@ async def reclip(req: ReclipRequest):
             cut_and_caption(source, start, end, ass_path, out_path,
                              zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
                              crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
-                             pip_x=req.pip_x, pip_y=req.pip_y)
+                             pip_x=req.pip_x, pip_y=req.pip_y, pip_scale=req.pip_scale)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 

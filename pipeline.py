@@ -1212,18 +1212,22 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # platform (TikTok, Instagram, etc) and player actually expects — 4:4:4
     # output isn't reliably compatible anyway, so this is a strict
     # improvement, not just a memory workaround.
-    # Quality bump: previously no -crf was set at all, so libx264 fell back
-    # to its own default (23) at "veryfast", which is tuned for encode
-    # speed over compression efficiency — soft/blocky on higher-motion
-    # footage (gameplay, fast cuts). -crf 20 is a real, visible sharpness
-    # improvement (lower = higher quality/bigger file); "fast" trades a bit
-    # more encode time for noticeably better compression than "veryfast" at
-    # the same quality. This does NOT touch the levers that actually caused
-    # the OOM history above (thread count, pixel format, source resolution)
-    # — those stay exactly as fixed — so this should be a safe quality win,
-    # not a reintroduction of that risk. Bumped -b:a too since audio was
-    # left at ffmpeg's low-ish AAC default.
-    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-threads", "2", "-pix_fmt", "yuv420p",
+    # Quality: previously no -crf was set at all, so libx264 fell back to
+    # its own default (23) at "veryfast". -crf 20 alone is a real, visible
+    # sharpness improvement (lower = higher quality/bigger file) and, unlike
+    # the preset, doesn't allocate extra encoder buffers — it just steers
+    # the quantizer, so it's essentially free memory-wise.
+    #
+    # A "fast"-preset version of this shipped briefly and got reverted: it
+    # OOM-killed a real user's upload almost immediately (confirmed via a
+    # "Killed" kernel log line right after their render started). "fast"
+    # adds more reference frames + a larger motion-search/lookahead window
+    # than "veryfast" — real memory cost, not just CPU — and this
+    # container's 1GB ceiling has no slack for that. Staying on "veryfast"
+    # keeps the actual OOM risk where it was; -crf 20 is the quality win
+    # that's safe to keep. Bumped -b:a too since audio was left at ffmpeg's
+    # low-ish AAC default (negligible memory cost either way).
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "160k", str(out_path.resolve())]
     result = subprocess.run(
         cmd,

@@ -420,6 +420,11 @@ class ProcessRequest(BaseModel):
     crop_y: float = 0.0
     crop_w: float = 0.0
     crop_h: float = 1.0
+    # Vertical position (0..1, default 0.5=centered) of the facecam crop
+    # WITHIN the padded 1080x1920 output — lets it be nudged up/down after
+    # the fact without re-selecting the crop box. Ignored when no manual
+    # crop is active (crop_w<=0).
+    facecam_offset_y: float = 0.5
     top_text: str = ""                 # optional pinned title/hook text at the top of the frame
     top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
 
@@ -444,6 +449,7 @@ class ReclipRequest(BaseModel):
     crop_y: float = 0.0
     crop_w: float = 0.0
     crop_h: float = 1.0
+    facecam_offset_y: float = 0.5
     top_text: str = ""
     top_text_colors: List[str] = []
 
@@ -1112,7 +1118,8 @@ def _color_grade_filter(preset: str) -> str:
 
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
                      zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False,
-                     crop_x: float = 0.0, crop_y: float = 0.0, crop_w: float = 0.0, crop_h: float = 1.0):
+                     crop_x: float = 0.0, crop_y: float = 0.0, crop_w: float = 0.0, crop_h: float = 1.0,
+                     facecam_offset_y: float = 0.5):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
     and/or a color grading preset, burns in the animated karaoke captions,
     and adds a short automatic fade-in/fade-out on every clip — all via
@@ -1157,18 +1164,34 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # up front.
     if crop_w and crop_w > 0:
         # Manual box — clamped defensively since this ultimately comes from
-        # user input via the API. scale+crop (rather than a plain stretch)
-        # so a facecam box that isn't already 9:16 fills the frame cleanly
-        # without warping faces.
+        # user input via the API.
+        #
+        # scale with force_original_aspect_ratio=decrease + pad (fit
+        # WITHIN the frame, letterbox the rest) — NOT increase+crop
+        # (fill the frame, cropping the overflow). A facecam box is
+        # usually landscape-ish or square, and force-filling a tall 9:16
+        # target from that shape means the width has to stretch far more
+        # than the height, so the crop-to-fill step was throwing away most
+        # of the width and frequently cutting the actual face out of frame
+        # entirely — which is exactly the "I don't see it" bug this
+        # replaces. decrease+pad guarantees the WHOLE selected box is
+        # always visible, at the cost of black bars above/below (or either
+        # side) instead of silently losing content.
+        #
+        # facecam_offset_y (0..1, default 0.5=centered) controls where the
+        # visible facecam sits vertically within those bars via pad's y
+        # expression — 0 pins it to the top, 1 to the bottom — so it can be
+        # nudged up/down after the fact without re-selecting the crop box.
         crop_x = max(0.0, min(1.0, crop_x))
         crop_y = max(0.0, min(1.0, crop_y))
         crop_w = max(0.05, min(1.0 - crop_x, crop_w))
         crop_h = max(0.05, min(1.0 - crop_y, crop_h))
+        facecam_offset_y = max(0.0, min(1.0, facecam_offset_y))
         vf_stages = [
             f"crop=w='iw*{crop_w:.4f}':h='ih*{crop_h:.4f}':"
             f"x='iw*{crop_x:.4f}':y='ih*{crop_y:.4f}'",
-            "scale=1080:1920:force_original_aspect_ratio=increase",
-            "crop=1080:1920",
+            "scale=1080:1920:force_original_aspect_ratio=decrease",
+            f"pad=w=1080:h=1920:x='(ow-iw)/2':y='(oh-ih)*{facecam_offset_y:.4f}':color=black",
         ]
     else:
         vf_stages = [
@@ -1860,7 +1883,8 @@ def _default_opts() -> dict:
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
-        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, top_text="", top_text_colors=[],
+        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, facecam_offset_y=0.5,
+        top_text="", top_text_colors=[],
     )
 
 
@@ -1922,7 +1946,8 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
                              zoom_pan=opts["zoom_pan"], color_preset=opts["color_preset"],
                              flash_intro=opts["flash_intro"],
                              crop_x=opts.get("crop_x", 0.0), crop_y=opts.get("crop_y", 0.0),
-                             crop_w=opts.get("crop_w", 0.0), crop_h=opts.get("crop_h", 1.0))
+                             crop_w=opts.get("crop_w", 0.0), crop_h=opts.get("crop_h", 1.0),
+                             facecam_offset_y=opts.get("facecam_offset_y", 0.5))
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
@@ -2013,6 +2038,7 @@ async def process(req: ProcessRequest):
             sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
             flash_intro=req.flash_intro,
             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
+            facecam_offset_y=req.facecam_offset_y,
             top_text=req.top_text, top_text_colors=req.top_text_colors,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
@@ -2045,6 +2071,7 @@ async def process_upload(
     crop_y: float = Form(0.0),
     crop_w: float = Form(0.0),
     crop_h: float = Form(1.0),
+    facecam_offset_y: float = Form(0.5),
     top_text: str = Form(""),
     top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
                                        # forms don't carry real arrays, unlike the JSON endpoints
@@ -2086,6 +2113,7 @@ async def process_upload(
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
         flash_intro=flash_intro, crop_x=crop_x, crop_y=crop_y, crop_w=crop_w, crop_h=crop_h,
+        facecam_offset_y=facecam_offset_y,
         top_text=top_text,
         top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
     )
@@ -2161,7 +2189,8 @@ async def reclip(req: ReclipRequest):
         try:
             cut_and_caption(source, start, end, ass_path, out_path,
                              zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
-                             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h)
+                             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
+                             facecam_offset_y=req.facecam_offset_y)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 

@@ -409,22 +409,24 @@ class ProcessRequest(BaseModel):
     sfx_position: str = "end"          # "start" or "end"
     typing_sound: bool = False         # ambient typing-click bed under the whole clip
     flash_intro: bool = False          # white flash-in + shutter click instead of a plain fade
-    # Facecam crop — cuts an arbitrary rectangle out of the SOURCE frame
-    # (fractions 0..1) and blows it up to fill the whole 1080x1920 output,
-    # instead of just cropping a centered 9:16 window. Lets someone cut a
-    # small facecam out of a corner and make IT the whole clip. crop_w<=0
-    # is the sentinel for "no manual crop" — falls back to the old
-    # default behavior (auto-centered 9:16 crop of the full frame). See
-    # cut_and_caption() below for the actual filter.
+    # Facecam PIP — crop_x/y/w/h (fractions 0..1) define an arbitrary
+    # rectangle to cut out of the SOURCE frame, e.g. a facecam sitting in a
+    # corner of a gameplay recording. The MAIN clip keeps its normal
+    # auto-centered 9:16 crop; the facecam region is composited as a small
+    # floating bubble ON TOP of it (picture-in-picture), positioned via
+    # pip_x/pip_y. crop_w<=0 is the sentinel for "no facecam" — falls back
+    # to the plain single-layer auto-centered crop. See cut_and_caption()
+    # below for the actual filter graph.
     crop_x: float = 0.0
     crop_y: float = 0.0
     crop_w: float = 0.0
     crop_h: float = 1.0
-    # Vertical position (0..1, default 0.5=centered) of the facecam crop
-    # WITHIN the padded 1080x1920 output — lets it be nudged up/down after
-    # the fact without re-selecting the crop box. Ignored when no manual
-    # crop is active (crop_w<=0).
-    facecam_offset_y: float = 0.5
+    # Position (0..1 each, default top-right-ish) of the facecam bubble's
+    # top-left corner within the 1080x1920 canvas — draggable, lets it be
+    # repositioned anywhere without re-selecting the crop box. Ignored when
+    # no facecam is active (crop_w<=0).
+    pip_x: float = 0.65
+    pip_y: float = 0.04
     top_text: str = ""                 # optional pinned title/hook text at the top of the frame
     top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
 
@@ -449,7 +451,8 @@ class ReclipRequest(BaseModel):
     crop_y: float = 0.0
     crop_w: float = 0.0
     crop_h: float = 1.0
-    facecam_offset_y: float = 0.5
+    pip_x: float = 0.65
+    pip_y: float = 0.04
     top_text: str = ""
     top_text_colors: List[str] = []
 
@@ -1119,7 +1122,7 @@ def _color_grade_filter(preset: str) -> str:
 def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_path: Path,
                      zoom_pan: bool = False, color_preset: str = "none", flash_intro: bool = False,
                      crop_x: float = 0.0, crop_y: float = 0.0, crop_w: float = 0.0, crop_h: float = 1.0,
-                     facecam_offset_y: float = 0.5):
+                     pip_x: float = 0.65, pip_y: float = 0.04):
     """Cuts the clip, reframes to 9:16, optionally applies a Ken Burns zoom
     and/or a color grading preset, burns in the animated karaoke captions,
     and adds a short automatic fade-in/fade-out on every clip — all via
@@ -1149,66 +1152,80 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     fade_d = max(0.0, min(0.3, duration / 6))
     fade_color = "white" if flash_intro else "black"
 
-    # Facecam crop — crop_w/crop_h/crop_x/crop_y (all fractions 0..1 of the
-    # SOURCE frame) let the caller cut an ARBITRARY rectangle out of the
-    # frame and blow it up to fill the whole 1080x1920 output, e.g. cutting
-    # just a facecam out of a corner and making it the entire clip. This
-    # replaced the old single-point "reposition" pan control, which could
-    # only slide a fixed 9:16 window around and couldn't target something
-    # as small as a corner facecam.
+    # Post-processing stages that always apply to the FINAL composited
+    # frame regardless of which path below builds it — zoom, color grade,
+    # then captions (always last, so they stay crisp on top of everything
+    # else instead of getting graded/zoomed themselves), then the fade.
+    post_stages = []
+    if zoom_pan:
+        post_stages.append(_zoompan_filter())
+    if color_preset and color_preset != "none":
+        cg = _color_grade_filter(color_preset)
+        if cg:
+            post_stages.append(cg)
+    post_stages.append(f"ass='{ass_name}'")
+    if fade_d > 0:
+        post_stages.append(f"fade=t=in:st=0:d={fade_d}:color={fade_color}")
+        post_stages.append(f"fade=t=out:st={max(0.0, duration - fade_d)}:d={fade_d}")
+
+    # Facecam PIP — crop_w/crop_h/crop_x/crop_y (all fractions 0..1 of the
+    # SOURCE frame) define an arbitrary rectangle to cut out of the frame,
+    # e.g. a facecam sitting in a corner of a gameplay recording.
     #
-    # crop_w<=0 is the sentinel for "no manual crop" (the default) — falls
-    # back to the previous behavior, an auto-centered 9:16 crop of the full
-    # frame, using ffmpeg's own iw/ih expressions so it adapts to whatever
-    # the source resolution actually is without Python needing to know it
-    # up front.
+    # This does NOT replace the main clip — the main video keeps its
+    # normal auto-centered 9:16 crop as the background, and the facecam
+    # region is composited as a small floating bubble on top of it
+    # (picture-in-picture), draggable to any position via pip_x/pip_y
+    # (0..1, fraction of the 1080x1920 canvas — the bubble's top-left
+    # corner). An earlier version replaced the ENTIRE clip with just the
+    # blown-up facecam, which lost the original video — this is the
+    # correct standard behavior other clipping tools use.
+    #
+    # crop_w<=0 is the sentinel for "no facecam" (the default) — falls
+    # back to the plain single-layer auto-centered 9:16 crop, using
+    # ffmpeg's own iw/ih expressions so it adapts to whatever the source
+    # resolution actually is without Python needing to know it up front.
     if crop_w and crop_w > 0:
-        # Manual box — clamped defensively since this ultimately comes from
-        # user input via the API.
-        #
-        # scale with force_original_aspect_ratio=decrease + pad (fit
-        # WITHIN the frame, letterbox the rest) — NOT increase+crop
-        # (fill the frame, cropping the overflow). A facecam box is
-        # usually landscape-ish or square, and force-filling a tall 9:16
-        # target from that shape means the width has to stretch far more
-        # than the height, so the crop-to-fill step was throwing away most
-        # of the width and frequently cutting the actual face out of frame
-        # entirely — which is exactly the "I don't see it" bug this
-        # replaces. decrease+pad guarantees the WHOLE selected box is
-        # always visible, at the cost of black bars above/below (or either
-        # side) instead of silently losing content.
-        #
-        # facecam_offset_y (0..1, default 0.5=centered) controls where the
-        # visible facecam sits vertically within those bars via pad's y
-        # expression — 0 pins it to the top, 1 to the bottom — so it can be
-        # nudged up/down after the fact without re-selecting the crop box.
         crop_x = max(0.0, min(1.0, crop_x))
         crop_y = max(0.0, min(1.0, crop_y))
         crop_w = max(0.05, min(1.0 - crop_x, crop_w))
         crop_h = max(0.05, min(1.0 - crop_y, crop_h))
-        facecam_offset_y = max(0.0, min(1.0, facecam_offset_y))
-        vf_stages = [
-            f"crop=w='iw*{crop_w:.4f}':h='ih*{crop_h:.4f}':"
-            f"x='iw*{crop_x:.4f}':y='ih*{crop_y:.4f}'",
-            "scale=1080:1920:force_original_aspect_ratio=decrease",
-            f"pad=w=1080:h=1920:x='(ow-iw)/2':y='(oh-ih)*{facecam_offset_y:.4f}':color=black",
+        pip_x = max(0.0, min(1.0, pip_x))
+        pip_y = max(0.0, min(1.0, pip_y))
+
+        PIP_WIDTH_PX = 340   # facecam bubble width on the 1080-wide canvas
+        PIP_BORDER_PX = 4    # white border so the bubble reads as intentional, not a stray rectangle
+
+        filter_complex_stages = [
+            # split=2 duplicates the decoded frames into two independent
+            # chains from the SAME input — one becomes the full background,
+            # the other becomes the small facecam bubble.
+            "[0:v]split=2[bg_src][fc_src]",
+            "[bg_src]crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':"
+            "x='(in_w-out_w)/2':y='(in_h-out_h)/2',scale=1080:1920[bg]",
+            f"[fc_src]crop=w='iw*{crop_w:.4f}':h='ih*{crop_h:.4f}':"
+            f"x='iw*{crop_x:.4f}':y='ih*{crop_y:.4f}',"
+            # scale=W:-2 preserves the crop's own aspect ratio (no
+            # distortion) — -2 (not -1) so the auto-computed height always
+            # rounds to an even number, required for yuv420p output.
+            f"scale={PIP_WIDTH_PX}:-2,"
+            f"pad=iw+{PIP_BORDER_PX*2}:ih+{PIP_BORDER_PX*2}:{PIP_BORDER_PX}:{PIP_BORDER_PX}:color=white[fc]",
+            # min(main_w*pip_x, main_w-overlay_w) clamps server-side too —
+            # the bubble can never hang off the right/bottom edge even if a
+            # stale/out-of-range pip_x or pip_y ever comes through.
+            f"[bg][fc]overlay=x='min(main_w*{pip_x:.4f},main_w-overlay_w)':"
+            f"y='min(main_h*{pip_y:.4f},main_h-overlay_h)'[merged]",
+            f"[merged]{','.join(post_stages)}[vout]",
         ]
+        filter_complex = ";".join(filter_complex_stages)
+        use_filter_complex = True
     else:
         vf_stages = [
             "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='(in_w-out_w)/2':y='(in_h-out_h)/2'",
             "scale=1080:1920",
-        ]
-    if zoom_pan:
-        vf_stages.append(_zoompan_filter())
-    if color_preset and color_preset != "none":
-        cg = _color_grade_filter(color_preset)
-        if cg:
-            vf_stages.append(cg)
-    vf_stages.append(f"ass='{ass_name}'")
-    if fade_d > 0:
-        vf_stages.append(f"fade=t=in:st=0:d={fade_d}:color={fade_color}")
-        vf_stages.append(f"fade=t=out:st={max(0.0, duration - fade_d)}:d={fade_d}")
-    vf = ",".join(vf_stages)
+        ] + post_stages
+        vf = ",".join(vf_stages)
+        use_filter_complex = False
 
     af_stages = []
     if fade_d > 0:
@@ -1222,8 +1239,16 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
     # OOM-killed silently (no ffmpeg error text at all, just a nonzero exit
     # with 0 frames encoded). Capping threads keeps memory use predictable
     # on a resource-limited container.
-    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source.resolve()), "-t", str(duration),
-           "-vf", vf]
+    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source.resolve()), "-t", str(duration)]
+    if use_filter_complex:
+        # filter_complex mode needs explicit -map (unlike -vf, it doesn't
+        # auto-pass-through unfiltered streams) — [vout] is this function's
+        # final labeled video stage above; 0:a? maps the source's audio
+        # stream if it has one, "?" makes it optional so a silent source
+        # doesn't hard-fail the whole render.
+        cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "0:a?"]
+    else:
+        cmd += ["-vf", vf]
     if af:
         cmd += ["-af", af]
     # -pix_fmt yuv420p: without this, ffmpeg inherits whatever chroma
@@ -1883,7 +1908,7 @@ def _default_opts() -> dict:
         voiceover=False, voiceover_voice=DEFAULT_VOICE, voiceover_style=DEFAULT_VOICEOVER_STYLE,
         zoom_pan=False, color_preset="none", caption_style=DEFAULT_CAPTION_STYLE,
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
-        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, facecam_offset_y=0.5,
+        crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, pip_x=0.65, pip_y=0.04,
         top_text="", top_text_colors=[],
     )
 
@@ -1947,7 +1972,7 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
                              flash_intro=opts["flash_intro"],
                              crop_x=opts.get("crop_x", 0.0), crop_y=opts.get("crop_y", 0.0),
                              crop_w=opts.get("crop_w", 0.0), crop_h=opts.get("crop_h", 1.0),
-                             facecam_offset_y=opts.get("facecam_offset_y", 0.5))
+                             pip_x=opts.get("pip_x", 0.65), pip_y=opts.get("pip_y", 0.04))
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip {i}: {e}")
 
@@ -2038,7 +2063,7 @@ async def process(req: ProcessRequest):
             sfx=req.sfx, sfx_position=req.sfx_position, typing_sound=req.typing_sound,
             flash_intro=req.flash_intro,
             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
-            facecam_offset_y=req.facecam_offset_y,
+            pip_x=req.pip_x, pip_y=req.pip_y,
             top_text=req.top_text, top_text_colors=req.top_text_colors,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
@@ -2071,7 +2096,8 @@ async def process_upload(
     crop_y: float = Form(0.0),
     crop_w: float = Form(0.0),
     crop_h: float = Form(1.0),
-    facecam_offset_y: float = Form(0.5),
+    pip_x: float = Form(0.65),
+    pip_y: float = Form(0.04),
     top_text: str = Form(""),
     top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
                                        # forms don't carry real arrays, unlike the JSON endpoints
@@ -2113,7 +2139,7 @@ async def process_upload(
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
         sfx=sfx, sfx_position=sfx_position, typing_sound=typing_sound,
         flash_intro=flash_intro, crop_x=crop_x, crop_y=crop_y, crop_w=crop_w, crop_h=crop_h,
-        facecam_offset_y=facecam_offset_y,
+        pip_x=pip_x, pip_y=pip_y,
         top_text=top_text,
         top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
     )
@@ -2190,7 +2216,7 @@ async def reclip(req: ReclipRequest):
             cut_and_caption(source, start, end, ass_path, out_path,
                              zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
                              crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
-                             facecam_offset_y=req.facecam_offset_y)
+                             pip_x=req.pip_x, pip_y=req.pip_y)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 

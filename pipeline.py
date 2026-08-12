@@ -429,6 +429,15 @@ class ProcessRequest(BaseModel):
     pip_y: float = 0.04
     top_text: str = ""                 # optional pinned title/hook text at the top of the frame
     top_text_colors: List[str] = []    # per-word color for top_text, see TOP_TEXT_COLORS
+    # Extra text properties — all default to whatever the current baked-in
+    # look already was, so omitting them from a request renders identically
+    # to before these existed.
+    caption_position: str = "bottom"        # "top" | "center" | "bottom" — spoken captions
+    caption_uppercase: bool = False         # force ALL CAPS on spoken captions
+    caption_bold: Optional[bool] = None     # None = use the caption_style's own bold; True/False overrides it
+    top_text_position: str = "top"          # "top" | "center" | "bottom" — pinned title text
+    top_text_uppercase: bool = False        # force ALL CAPS on the pinned title text
+    top_text_bold: bool = True              # top text has always rendered bold; toggle to turn it off
 
 
 class ReclipRequest(BaseModel):
@@ -455,6 +464,12 @@ class ReclipRequest(BaseModel):
     pip_y: float = 0.04
     top_text: str = ""
     top_text_colors: List[str] = []
+    caption_position: str = "bottom"
+    caption_uppercase: bool = False
+    caption_bold: Optional[bool] = None
+    top_text_position: str = "top"
+    top_text_uppercase: bool = False
+    top_text_bold: bool = True
 
 
 class RegenerateVoiceoverRequest(BaseModel):
@@ -923,10 +938,32 @@ TOP_TEXT_COLORS = {
 }
 DEFAULT_TOP_TEXT_COLOR = "white"
 
+# Vertical placement presets for burned-in text — maps to (ASS Alignment,
+# MarginV). Alignment uses the numpad layout libass expects: 7/8/9=top
+# row, 4/5/6=middle row, 1/2/3=bottom row; the middle digit of each row is
+# horizontal-center, which is all every preset here uses (2/5/8). MarginV
+# is ignored by libass for the middle row, so 0 there is fine. The
+# "bottom" caption default (2, 190) and "top" top-text default (8, 70)
+# match the pixel values this function always used before positioning was
+# configurable, so leaving these unset renders pixel-identical to before.
+CAPTION_POSITIONS = {
+    "top": (8, 90),
+    "center": (5, 0),
+    "bottom": (2, 190),
+}
+TOP_TEXT_POSITIONS = {
+    "top": (8, 70),
+    "center": (5, 0),
+    "bottom": (2, 100),
+}
+
 
 def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
                   chunk_size: Optional[int] = None, caption_style: str = DEFAULT_CAPTION_STYLE,
-                  top_text: str = "", top_text_colors: Optional[List[str]] = None):
+                  top_text: str = "", top_text_colors: Optional[List[str]] = None,
+                  caption_position: str = "bottom", caption_uppercase: bool = False,
+                  caption_bold: Optional[bool] = None, top_text_position: str = "top",
+                  top_text_uppercase: bool = False, top_text_bold: bool = True):
     """Writes an .ass subtitle file scoped to one clip's time range. Text
     color, font, outline weight, per-line word count, and which animation
     (if any) is used are all driven by `caption_style` (see CAPTION_STYLES)
@@ -962,11 +999,17 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
 
     clip_words = [w for w in words if clip_start <= w["start"] < clip_end]
 
-    # Colours are &HAABBGGRR. Outline/Shadow/Bold/Fontname/Fontsize all
-    # come from the selected style so each preset actually looks distinct.
-    # The second Style (TopText) is for the optional pinned title line —
-    # Alignment 8 = top-center, MarginV 70 keeps it clear of the very top
-    # edge/notch area on most phones.
+    # caption_bold=None keeps the style's own Bold field untouched (exact
+    # previous behavior); True/False explicitly forces it either way.
+    karaoke_bold = style["bold"] if caption_bold is None else (1 if caption_bold else 0)
+    top_text_bold_field = 1 if top_text_bold else 0
+    caption_align, caption_marginv = CAPTION_POSITIONS.get(caption_position, CAPTION_POSITIONS["bottom"])
+    top_text_align, top_text_marginv = TOP_TEXT_POSITIONS.get(top_text_position, TOP_TEXT_POSITIONS["top"])
+
+    # Colours are &HAABBGGRR. Outline/Shadow/Fontname/Fontsize come from
+    # the selected style so each preset actually looks distinct; Bold and
+    # vertical placement (Alignment/MarginV) are overridable per-request
+    # via the fields above.
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -988,10 +1031,10 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Karaoke,{style['font']},{style['size']},{style['primary']},{style['secondary']},"
-        f"&H00000000,&H00000000,{style['bold']},0,0,0,100,100,0,0,1,{style['outline']},"
-        f"{style['shadow']},2,60,60,190,1\n"
-        "Style: TopText,Liberation Sans Bold,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
-        "1,0,0,0,100,100,0,0,1,4,1,8,50,50,70,1\n\n"
+        f"&H00000000,&H00000000,{karaoke_bold},0,0,0,100,100,0,0,1,{style['outline']},"
+        f"{style['shadow']},{caption_align},60,60,{caption_marginv},1\n"
+        f"Style: TopText,Liberation Sans Bold,66,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        f"{top_text_bold_field},0,0,0,100,100,0,0,1,4,1,{top_text_align},50,50,{top_text_marginv},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -1001,6 +1044,8 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
         colors = top_text_colors or []
         runs = []
         for i, w in enumerate(top_words):
+            if top_text_uppercase:
+                w = w.upper()
             color = colors[i] if i < len(colors) else DEFAULT_TOP_TEXT_COLOR
             hexcode = TOP_TEXT_COLORS.get(color, TOP_TEXT_COLORS[DEFAULT_TOP_TEXT_COLOR])
             runs.append(f"{{\\c&H{hexcode}&}}{w}")
@@ -1029,7 +1074,10 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
         if not style["karaoke"]:
             # Static (or fade-only) presets: no per-word \k timing needed,
             # just render the whole line's text as one plain string.
-            text = " ".join(w["word"].strip() for w in chunk if w["word"].strip())
+            text = " ".join(
+                (w["word"].strip().upper() if caption_uppercase else w["word"].strip())
+                for w in chunk if w["word"].strip()
+            )
             if not text:
                 continue
             prefix = f"{{\\fad({FADE_MS},{FADE_MS})}}" if style["fade"] else ""
@@ -1045,6 +1093,8 @@ def words_to_ass(words, clip_start: float, clip_end: float, ass_path: Path,
             word = w["word"].strip()
             if not word:
                 continue
+            if caption_uppercase:
+                word = word.upper()
             # Offset of this word's own start, in ms, relative to the
             # Dialogue line's start — \t's time args are line-relative,
             # which is what lets each word in the group pop at its own
@@ -1910,6 +1960,8 @@ def _default_opts() -> dict:
         sfx="none", sfx_position="end", typing_sound=False, flash_intro=False,
         crop_x=0.0, crop_y=0.0, crop_w=0.0, crop_h=1.0, pip_x=0.65, pip_y=0.04,
         top_text="", top_text_colors=[],
+        caption_position="bottom", caption_uppercase=False, caption_bold=None,
+        top_text_position="top", top_text_uppercase=False, top_text_bold=True,
     )
 
 
@@ -1961,7 +2013,13 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
     for i, h in enumerate(highlights):
         ass_path = job_dir / f"clip_{i}.ass"
         words_to_ass(words, h["start"], h["end"], ass_path, caption_style=opts["caption_style"],
-                     top_text=opts.get("top_text", ""), top_text_colors=opts.get("top_text_colors", []))
+                     top_text=opts.get("top_text", ""), top_text_colors=opts.get("top_text_colors", []),
+                     caption_position=opts.get("caption_position", "bottom"),
+                     caption_uppercase=opts.get("caption_uppercase", False),
+                     caption_bold=opts.get("caption_bold", None),
+                     top_text_position=opts.get("top_text_position", "top"),
+                     top_text_uppercase=opts.get("top_text_uppercase", False),
+                     top_text_bold=opts.get("top_text_bold", True))
 
         out_name = f"{job_id}_{i}.mp4"
         out_path = OUTPUT_DIR / out_name
@@ -2065,6 +2123,9 @@ async def process(req: ProcessRequest):
             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
             pip_x=req.pip_x, pip_y=req.pip_y,
             top_text=req.top_text, top_text_colors=req.top_text_colors,
+            caption_position=req.caption_position, caption_uppercase=req.caption_uppercase,
+            caption_bold=req.caption_bold, top_text_position=req.top_text_position,
+            top_text_uppercase=req.top_text_uppercase, top_text_bold=req.top_text_bold,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
                                 opts, req.url, download_tier)
@@ -2101,6 +2162,12 @@ async def process_upload(
     top_text: str = Form(""),
     top_text_colors: str = Form(""),  # comma-separated, e.g. "white,red,white" — multipart
                                        # forms don't carry real arrays, unlike the JSON endpoints
+    caption_position: str = Form("bottom"),
+    caption_uppercase: bool = Form(False),
+    caption_bold: Optional[bool] = Form(None),
+    top_text_position: str = Form("top"),
+    top_text_uppercase: bool = Form(False),
+    top_text_bold: bool = Form(True),
 ):
     """Same pipeline as /process, but for a video the user uploads directly
     instead of a YouTube/Twitch/etc URL — skips yt-dlp entirely, so this
@@ -2142,6 +2209,8 @@ async def process_upload(
         pip_x=pip_x, pip_y=pip_y,
         top_text=top_text,
         top_text_colors=[c.strip() for c in top_text_colors.split(",") if c.strip()],
+        caption_position=caption_position, caption_uppercase=caption_uppercase, caption_bold=caption_bold,
+        top_text_position=top_text_position, top_text_uppercase=top_text_uppercase, top_text_bold=top_text_bold,
     )
     # See /process above — same memory-safety lock around the actual
     # transcription/render/voiceover/mix work, not the upload itself.
@@ -2203,7 +2272,10 @@ async def reclip(req: ReclipRequest):
 
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
     words_to_ass(words, start, end, ass_path, caption_style=req.caption_style,
-                 top_text=req.top_text, top_text_colors=req.top_text_colors)
+                 top_text=req.top_text, top_text_colors=req.top_text_colors,
+                 caption_position=req.caption_position, caption_uppercase=req.caption_uppercase,
+                 caption_bold=req.caption_bold, top_text_position=req.top_text_position,
+                 top_text_uppercase=req.top_text_uppercase, top_text_bold=req.top_text_bold)
 
     out_name = f"{req.job_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_path = OUTPUT_DIR / out_name

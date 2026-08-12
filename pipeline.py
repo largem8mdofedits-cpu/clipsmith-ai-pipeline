@@ -17,6 +17,7 @@ See README.md in this folder for full setup instructions.
 import asyncio
 import base64
 import gc
+import hashlib
 import importlib.util
 import os
 import json
@@ -149,6 +150,51 @@ def cleanup_old_jobs():
             print(f"Job cleanup skipped {job_dir}: {e}")
 
 
+# Shared cache of already-downloaded SOURCE videos, keyed by URL — separate
+# from JOBS_DIR (which is per-request scratch space). If two different
+# users clip the same YouTube video, or the same user hits "try a different
+# moment" on a fresh job for a video already seen recently, this skips
+# yt-dlp entirely instead of re-downloading (and, once a paid proxy tier
+# exists — see download_video() below — re-paying for it). Doesn't survive
+# a redeploy (this directory isn't on a persistent volume), but does
+# survive for the container's whole uptime between deploys, which is where
+# the real savings are: any video more than one person clips in that
+# window only ever costs one download.
+SOURCE_CACHE_DIR = Path(__file__).parent / "source_cache"
+SOURCE_CACHE_DIR.mkdir(exist_ok=True)
+SOURCE_CACHE_TTL_SECONDS = 24 * 60 * 60  # a day is plenty for "still trending" reuse
+SOURCE_CACHE_MAX_ENTRIES = 40  # crude size cap for Railway's small ephemeral disk
+
+
+def _source_cache_path(url: str) -> Path:
+    key = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:20]
+    return SOURCE_CACHE_DIR / f"{key}.mp4"
+
+
+def _source_cache_get(url: str) -> Optional[Path]:
+    cached = _source_cache_path(url)
+    if not cached.exists():
+        return None
+    if (time.time() - cached.stat().st_mtime) > SOURCE_CACHE_TTL_SECONDS:
+        cached.unlink(missing_ok=True)
+        return None
+    cached.touch()  # bump mtime — this entry was just reused, keep it around longer (crude LRU)
+    return cached
+
+
+def _source_cache_put(url: str, downloaded_path: Path):
+    """Best-effort — caching a source video should never fail the request
+    it's attached to, so any error here is swallowed after logging."""
+    try:
+        shutil.copyfile(downloaded_path, _source_cache_path(url))
+        entries = sorted(SOURCE_CACHE_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+        while len(entries) > SOURCE_CACHE_MAX_ENTRIES:
+            oldest = entries.pop(0)
+            oldest.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"Source cache write skipped: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Config — all via env vars so this runs the same locally and on Railway.
 # ---------------------------------------------------------------------------
@@ -207,6 +253,22 @@ PIPELINE_PUBLIC_URL = os.environ.get("PIPELINE_PUBLIC_URL", "https://clipsmith-a
 # YouTube from a datacenter IP. Not a guaranteed bypass (YouTube's own docs
 # say so), but a free, real improvement with no account/cookies required.
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").rstrip("/")
+
+# Two OPTIONAL proxy tiers, both off by default and only ever used as a
+# fallback — see download_video() below for the full ordering. Nothing
+# routes through either of these unless the free tier (PO token + cookies
+# + client rotation, above) has already failed for a given video, so
+# there's no bandwidth cost paid on requests that would have worked
+# anyway. Standard yt-dlp --proxy URL format for both, e.g.
+# "http://user:pass@host:port" or "socks5://host:port".
+#   YTDLP_OWN_PROXY_URL  — anything you're running yourself (a home
+#                          connection, a personal VPS, whatever) — free
+#                          to you, so it's tried before paying for anything.
+#   YTDLP_PAID_PROXY_URL — a commercial residential proxy (e.g. Decodo) —
+#                          the true last resort, only reached if BOTH the
+#                          free tier and your own proxy have failed.
+YTDLP_OWN_PROXY_URL = os.environ.get("YTDLP_OWN_PROXY_URL", "").strip()
+YTDLP_PAID_PROXY_URL = os.environ.get("YTDLP_PAID_PROXY_URL", "").strip()
 
 # A handful of ElevenLabs' stable premade voice IDs, exposed under friendly
 # names for the frontend's voice picker. (These IDs are ElevenLabs' own
@@ -400,24 +462,13 @@ class ApplyGameplayBgRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Download + audio extraction
 # ---------------------------------------------------------------------------
-def download_video(url: str, dest: Path) -> Path:
-    """Downloads the source video with yt-dlp (installed separately, see README).
-
-    Format selector: modern YouTube usually serves video and audio as
-    separate streams rather than one combined file, so a bare '-f mp4'
-    often fails or silently grabs a low-quality legacy stream. This
-    selector asks for the best available mp4 video + m4a audio and merges
-    them, falling back to the best combined stream if that's unavailable
-    for a given video. --merge-output-format mp4 forces the merged result
-    into an actual .mp4 container regardless of the source formats.
-
-    --remote-components ejs:github --js-runtimes deno: YouTube's player JS
-    is obfuscated, and yt-dlp needs to execute it to derive the signature
-    used in download URLs. Requires Deno installed and on PATH (see
-    README) — without it, downloads fail with a JS-runtime error.
-    """
-    out_path = dest / "source.mp4"
-
+def _ytdlp_attempt(url: str, out_path: Path, dest: Path, proxy_url: str = "") -> str:
+    """Runs the full client-rotation loop (see download_video's docstring
+    for why each client is tried) ONCE, optionally through a single proxy
+    for every client attempt. Returns "" on success, or the last error's
+    stderr tail on failure — never raises, so callers can chain multiple
+    tiers (no proxy → own proxy → paid proxy) without a try/except per
+    tier."""
     base_args = [
         "yt-dlp",
         # Capped at 1080p: the final output is always cropped/scaled to
@@ -433,6 +484,8 @@ def download_video(url: str, dest: Path) -> Path:
         "--remote-components", "ejs:github",
         "--js-runtimes", "deno",
     ]
+    if proxy_url:
+        base_args += ["--proxy", proxy_url]
     # Point yt-dlp at our self-hosted PO token provider (see
     # POT_PROVIDER_URL above) so its bgutil plugin can fetch a
     # proof-of-origin token — this is a separate --extractor-args flag
@@ -475,9 +528,59 @@ def download_video(url: str, dest: Path) -> Path:
 
         result = subprocess.run(args, capture_output=True, text=True)
         if result.returncode == 0 and out_path.exists():
-            return out_path
+            return ""
         last_error = result.stderr[-1200:]
-        print(f"yt-dlp attempt with player_client={client} failed, trying next client if any:\n{last_error}")
+        print(f"yt-dlp attempt with player_client={client}"
+              f"{' via proxy' if proxy_url else ''} failed, trying next client if any:\n{last_error}")
+    return last_error
+
+
+def download_video(url: str, dest: Path) -> Path:
+    """Downloads the source video with yt-dlp (installed separately, see
+    README), checking the shared source cache first (see SOURCE_CACHE_DIR
+    above) so a video already downloaded recently — by anyone, for any
+    job — never gets pulled twice.
+
+    On a cache miss, tries three tiers in order, each one only reached if
+    the previous genuinely failed:
+      1. No proxy at all — just the PO token provider + cookies + the
+         client-rotation loop. This is free and, per yt-dlp's own
+         guidance, the most effective mitigation there is; it should
+         succeed for the large majority of videos on its own.
+      2. YTDLP_OWN_PROXY_URL, if set — anything free/self-hosted you're
+         already running.
+      3. YTDLP_PAID_PROXY_URL, if set — a commercial residential proxy
+         (e.g. Decodo). The true last resort, so its bandwidth cost scales
+         with how often YouTube actually blocks tier 1, not with total
+         traffic.
+    Every successful download (any tier) is written into the shared cache
+    for next time.
+    """
+    out_path = dest / "source.mp4"
+
+    cached = _source_cache_get(url)
+    if cached:
+        shutil.copyfile(cached, out_path)
+        return out_path
+
+    last_error = _ytdlp_attempt(url, out_path, dest, proxy_url="")
+
+    if last_error and YTDLP_OWN_PROXY_URL:
+        print("Free tier failed — retrying via YTDLP_OWN_PROXY_URL...")
+        last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_OWN_PROXY_URL) or ""
+        if not last_error:
+            _source_cache_put(url, out_path)
+            return out_path
+    elif not last_error:
+        _source_cache_put(url, out_path)
+        return out_path
+
+    if last_error and YTDLP_PAID_PROXY_URL:
+        print("Own-proxy tier failed (or unset) — retrying via YTDLP_PAID_PROXY_URL...")
+        last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_PAID_PROXY_URL) or ""
+        if not last_error:
+            _source_cache_put(url, out_path)
+            return out_path
 
     hint = (
         "\n\nYouTube is blocking downloads from this server (common for cloud-hosted "
@@ -485,7 +588,7 @@ def download_video(url: str, dest: Path) -> Path:
         "guarantee either bypasses its bot checks). Use the \"Upload your own video\" "
         "option instead — it skips YouTube entirely and always works."
     )
-    raise RuntimeError(f"yt-dlp failed on all player clients: {last_error}{hint}")
+    raise RuntimeError(f"yt-dlp failed on all player clients across every available tier: {last_error}{hint}")
 
 
 def extract_audio(video_path: Path, dest: Path) -> Path:
@@ -2732,6 +2835,8 @@ def health():
         "highlight_picking": "claude" if ANTHROPIC_API_KEY else "heuristic fallback",
         "youtube_cookies": "configured" if YTDLP_COOKIES else "not set (may hit YouTube bot checks)",
         "pot_provider": "configured" if POT_PROVIDER_URL else "not set",
+        "own_proxy_fallback": "configured" if YTDLP_OWN_PROXY_URL else "not set",
+        "paid_proxy_fallback": "configured" if YTDLP_PAID_PROXY_URL else "not set",
         "voiceover": "+".join(voiceover_providers) if voiceover_providers else "not configured",
         "direct_upload": "enabled",
         "zoom_pan": "enabled",

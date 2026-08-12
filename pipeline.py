@@ -29,7 +29,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -535,7 +535,7 @@ def _ytdlp_attempt(url: str, out_path: Path, dest: Path, proxy_url: str = "") ->
     return last_error
 
 
-def download_video(url: str, dest: Path) -> Path:
+def download_video(url: str, dest: Path) -> Tuple[Path, str]:
     """Downloads the source video with yt-dlp (installed separately, see
     README), checking the shared source cache first (see SOURCE_CACHE_DIR
     above) so a video already downloaded recently — by anyone, for any
@@ -555,13 +555,24 @@ def download_video(url: str, dest: Path) -> Path:
          traffic.
     Every successful download (any tier) is written into the shared cache
     for next time.
+
+    Returns (path, tier) where tier is one of "cache", "free", "own_proxy",
+    "paid_proxy" — the caller (_process_source, below) uses this to decide
+    whether the job actually cost anything on the paid proxy, instead of
+    assuming every YouTube-link job did. Before this, EVERY youtube job
+    reported its full downloaded size as "proxy usage" to the billing
+    backend regardless of which tier actually served it — meaning testing
+    (or any request the free tier handled fine) still chewed into the
+    site-wide Decodo dollar budget and each plan's proxy-MB cap even though
+    $0 was actually spent. Only a genuine paid_proxy download should count
+    against that budget.
     """
     out_path = dest / "source.mp4"
 
     cached = _source_cache_get(url)
     if cached:
         shutil.copyfile(cached, out_path)
-        return out_path
+        return out_path, "cache"
 
     last_error = _ytdlp_attempt(url, out_path, dest, proxy_url="")
 
@@ -570,17 +581,17 @@ def download_video(url: str, dest: Path) -> Path:
         last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_OWN_PROXY_URL) or ""
         if not last_error:
             _source_cache_put(url, out_path)
-            return out_path
+            return out_path, "own_proxy"
     elif not last_error:
         _source_cache_put(url, out_path)
-        return out_path
+        return out_path, "free"
 
     if last_error and YTDLP_PAID_PROXY_URL:
         print("Own-proxy tier failed (or unset) — retrying via YTDLP_PAID_PROXY_URL...")
         last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_PAID_PROXY_URL) or ""
         if not last_error:
             _source_cache_put(url, out_path)
-            return out_path
+            return out_path, "paid_proxy"
 
     hint = (
         "\n\nYouTube is blocking downloads from this server (common for cloud-hosted "
@@ -1809,13 +1820,19 @@ def _default_opts() -> dict:
 
 
 def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, clip_seconds: int,
-                     instruction: str, opts: dict, source_url: str = "") -> dict:
+                     instruction: str, opts: dict, source_url: str = "",
+                     download_tier: Optional[str] = None) -> dict:
     """Shared pipeline body for both /process (download-from-URL) and
     /process-upload (user's own file) — everything after "we have a
     source.mp4 on disk" is identical between the two entry points.
     `opts` holds every clip-rendering option (voiceover, zoom/color,
     caption style, sfx, background music, etc) so this signature doesn't
-    grow a new positional parameter every time a feature is added."""
+    grow a new positional parameter every time a feature is added.
+
+    download_tier is whatever download_video() returned for this source
+    ("cache" | "free" | "own_proxy" | "paid_proxy"), or None for an
+    uploaded file that never went through download_video() at all — see
+    billable_proxy_bytes below for why this matters."""
     try:
         duration = get_duration(source)
     except Exception as e:
@@ -1890,17 +1907,31 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
             "size_bytes": out_path.stat().st_size if out_path.exists() else 0,
         })
 
-    # source_bytes/is_youtube let the frontend report proxy bandwidth usage
-    # back to the billing backend accurately: uploads never touch the
-    # proxy (is_youtube=False, frontend won't report it as proxy usage),
-    # while a YouTube-link job's source_bytes IS what got pulled through
-    # the proxy to download it.
+    # source_bytes/is_youtube are informational (e.g. showing file size in
+    # the UI) — billable_proxy_bytes below is what the frontend should
+    # actually report to the billing backend as proxy usage.
+    #
+    # Only a download that genuinely went through YTDLP_PAID_PROXY_URL
+    # ("paid_proxy") costs real Decodo money. A cache hit, the free tier
+    # (PO token + cookies + client rotation), or your own free proxy all
+    # cost $0 — reporting those as proxy usage would eat into the site-wide
+    # Decodo dollar budget and each plan's proxy-MB cap for jobs that never
+    # touched the paid proxy at all, which is exactly what was happening
+    # before this field existed (every YouTube job reported its full
+    # download size as "proxy usage" regardless of which tier served it).
+    billable_proxy_bytes = (
+        source.stat().st_size
+        if (download_tier == "paid_proxy" and source.exists())
+        else 0
+    )
     return {
         "job_id": job_id,
         "clip_count": len(clips),
         "clips": clips,
         "source_bytes": source.stat().st_size if source.exists() else 0,
         "is_youtube": source_url not in ("", "uploaded file"),
+        "download_tier": download_tier,
+        "billable_proxy_bytes": billable_proxy_bytes,
         # Lets the backend enforce each plan's monthly "minutes of source
         # video" cap (see PLAN_MONTHLY_MINUTES in server.js) — this is the
         # length of the source video that was downloaded/uploaded and
@@ -1926,7 +1957,7 @@ async def process(req: ProcessRequest):
     # /process-upload below for the same fix.
     async with HEAVY_TASK_LOCK:
         try:
-            source = download_video(req.url, job_dir)
+            source, download_tier = download_video(req.url, job_dir)
         except Exception as e:
             raise HTTPException(400, f"Could not download video: {e}")
 
@@ -1938,7 +1969,7 @@ async def process(req: ProcessRequest):
             top_text=req.top_text, top_text_colors=req.top_text_colors,
         )
         return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
-                                opts, req.url)
+                                opts, req.url, download_tier)
 
 
 # Upload size cap: keeps a single request from blowing out Railway's small
@@ -2352,7 +2383,7 @@ async def download_social_video_endpoint(url: str = Form(...)):
     try:
         async with HEAVY_TASK_LOCK:
             try:
-                source = download_video(url, work_dir)
+                source, _download_tier = download_video(url, work_dir)
             except Exception as e:
                 raise HTTPException(400, f"Could not download that video: {e}")
 

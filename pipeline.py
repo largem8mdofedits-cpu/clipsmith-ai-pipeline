@@ -34,6 +34,7 @@ from typing import List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -2093,6 +2094,29 @@ async def process_upload(
     async with HEAVY_TASK_LOCK:
         return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
                                 opts, "uploaded file")
+
+
+@app.get("/source-preview/{job_id}")
+def source_preview(job_id: str):
+    """Serves the ORIGINAL, uncropped source video for a job — used by the
+    Facecam crop tool. The normal video preview shows the already-cropped
+    9:16 rendered clip, which is exactly the problem: if a facecam sits in
+    a corner of a wide source video, the default center-crop may have
+    already cut it out of frame, so there'd be nothing to select. This
+    endpoint lets the frontend show the TRUE full source frame instead
+    while the crop box is being positioned.
+
+    Deliberately serves ONLY source.mp4 by exact filename, never a
+    directory listing of job_dir — that directory can also contain a
+    per-job cookies.txt (written from YTDLP_COOKIES, see download_video()
+    above) when that env var is set, and that must never be publicly
+    reachable. Same job_id-gated access pattern as /reclip already uses,
+    so this isn't a new class of exposure — just a second, deliberately
+    narrow way to read the one file that's already used internally."""
+    source = JOBS_DIR / job_id / "source.mp4"
+    if not source.exists():
+        raise HTTPException(404, "This session has expired — generate the clip again to use Facecam crop.")
+    return FileResponse(str(source), media_type="video/mp4")
 
 
 @app.post("/reclip")

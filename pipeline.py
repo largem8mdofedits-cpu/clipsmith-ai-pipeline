@@ -1632,6 +1632,10 @@ def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool
     max_start = max(0.0, bg_duration - clip_duration)
     bg_start = random.uniform(0, max_start) if max_start > 0 else 0.0
 
+    # Fade duration capped the same way cut_and_caption does, so a very
+    # short clip never has its fade-in and fade-out overlap.
+    fade_d = max(0.0, min(0.3, clip_duration / 6))
+
     # Same 1GB-container memory ceiling as the main render path (see notes
     # near HEAVY_TASK_LOCK above) — this composite decodes TWO video
     # streams at once (the clip + the gameplay footage) instead of one,
@@ -1643,20 +1647,39 @@ def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool
     # -preset ultrafast, plus capping BOTH inputs' decode threads (not
     # just the encoder's), keeps peak memory well under the ceiling.
     # 720x1280 is still plenty sharp for a phone screen.
+    #
+    # The TOP half (the real clip) uses force_original_aspect_ratio=
+    # DECREASE + pad, not crop — it used to crop-to-fill like the bottom
+    # half does, but that silently cropped away the burned-in captions AND
+    # the top-text overlay every time, since both sit right at the very
+    # top/bottom edges of the 1080x1920 frame (by design — that's where
+    # subtitles and pinned titles go) and a center-crop down to a squarish
+    # 720x640 box discards exactly those edge bands first. Fit+pad (small
+    # black bars on the sides instead) guarantees nothing burned into the
+    # clip ever gets cut off. The BOTTOM half (gameplay b-roll) still
+    # crops-to-fill since there's no fixed UI element there that matters if
+    # it gets cropped.
+    vf_out = (
+        f"fade=t=in:st=0:d={fade_d}:color=black,"
+        f"fade=t=out:st={max(0.0, clip_duration - fade_d)}:d={fade_d}"
+    ) if fade_d > 0 else "null"
     cmd = [
         "ffmpeg", "-y",
         "-threads", "1", "-i", str(clip_path.resolve()),
         "-threads", "1", "-ss", f"{bg_start:.2f}", "-stream_loop", "-1", "-i", str(bg_path.resolve()),
         "-filter_complex",
-        "[0:v]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[top];"
+        "[0:v]scale=720:640:force_original_aspect_ratio=decrease,"
+        "pad=720:640:(ow-iw)/2:(oh-ih)/2:color=black[top];"
         "[1:v]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bot];"
-        "[top][bot]vstack=inputs=2[v]",
+        f"[top][bot]vstack=inputs=2[stacked];[stacked]{vf_out}[v]",
         "-map", "[v]", "-map", "0:a?",
         "-t", f"{clip_duration:.2f}",
         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest",
         str(out_path.resolve()),
     ]
+    if fade_d > 0:
+        cmd += ["-af", f"afade=t=in:st=0:d={fade_d},afade=t=out:st={max(0.0, clip_duration - fade_d)}:d={fade_d}"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Gameplay split-screen composite failed (exit {result.returncode}): {result.stderr[-1500:]}")

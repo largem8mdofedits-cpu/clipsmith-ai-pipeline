@@ -1342,6 +1342,14 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         vf = ",".join(vf_stages)
         use_filter_complex = False
 
+    # TEMPORARY diagnostic — see the matching print in /reclip. Confirms
+    # whether THIS specific render actually took the PIP compositing path,
+    # and whether the ass file it's about to burn in contains a TopText
+    # line — the two things that would make facecam/title visibly missing
+    # even though /reclip returned 200 OK. Remove once confirmed.
+    print(f"[cut_and_caption diag] out={out_path.name} pip_path={use_filter_complex} "
+          f"crop_w={crop_w} ass_has_toptext={'TopText,,' in ass_path.read_text(encoding='utf-8')}")
+
     af_stages = []
     if fade_d > 0:
         af_stages.append(f"afade=t=in:st=0:d={fade_d}")
@@ -2353,6 +2361,19 @@ async def reclip(req: ReclipRequest):
         if not picks:
             raise HTTPException(422, "Couldn't find another distinct moment in this video.")
         start, end = picks[0]["start"], picks[0]["end"]
+
+    # TEMPORARY diagnostic — a user reported facecam/top-text repeatedly
+    # missing from the final render despite setting both in the editor.
+    # Every other check (frontend field names, the crop_w>0/top_text
+    # non-empty gates below, collectClipOptions()) reads correctly by
+    # static inspection, so this logs exactly what actually arrived in
+    # the request for the next real attempt, to settle definitively
+    # whether it's a frontend send bug or something server-side. Remove
+    # once that's confirmed.
+    print(f"[reclip diag] job={req.job_id} crop=({req.crop_x:.3f},{req.crop_y:.3f},{req.crop_w:.3f},{req.crop_h:.3f}) "
+          f"pip=({req.pip_x:.3f},{req.pip_y:.3f},{req.pip_scale:.3f}) "
+          f"top_text={req.top_text!r} top_text_colors={req.top_text_colors} "
+          f"caption_style={req.caption_style!r}")
 
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
     words_to_ass(words, start, end, ass_path, caption_style=req.caption_style,

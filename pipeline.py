@@ -1342,14 +1342,6 @@ def cut_and_caption(source: Path, start: float, end: float, ass_path: Path, out_
         vf = ",".join(vf_stages)
         use_filter_complex = False
 
-    # TEMPORARY diagnostic — see the matching print in /reclip. Confirms
-    # whether THIS specific render actually took the PIP compositing path,
-    # and whether the ass file it's about to burn in contains a TopText
-    # line — the two things that would make facecam/title visibly missing
-    # even though /reclip returned 200 OK. Remove once confirmed.
-    print(f"[cut_and_caption diag] out={out_path.name} pip_path={use_filter_complex} "
-          f"crop_w={crop_w} ass_has_toptext={'TopText,,' in ass_path.read_text(encoding='utf-8')}")
-
     af_stages = []
     if fade_d > 0:
         af_stages.append(f"afade=t=in:st=0:d={fade_d}")
@@ -2285,12 +2277,6 @@ async def process_upload(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, "Uploaded file is empty.")
 
-    # Many phone/screen-recorder exports also leave the moov atom at the
-    # end of the file (not just yt-dlp's merged downloads) — remux so the
-    # Facecam crop tool's /source-preview loads fast for uploads too, not
-    # just YouTube-link jobs. Best-effort; see _faststart_remux's docstring.
-    await asyncio.to_thread(_faststart_remux, source)
-
     opts = dict(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
         zoom_pan=zoom_pan, color_preset=color_preset, caption_style=caption_style,
@@ -2306,7 +2292,26 @@ async def process_upload(
     )
     # See /process above — same memory-safety lock around the actual
     # transcription/render/voiceover/mix work, not the upload itself.
+    #
+    # The faststart remux (moov-atom rewrite) also moved in here, alongside
+    # _process_source — it used to sit OUTSIDE this lock, which was safe
+    # only because it was a synchronous, event-loop-blocking call: nothing
+    # else could run concurrently with it anyway, lock or no lock. Once it
+    # got wrapped in asyncio.to_thread() (see the event-loop-blocking fix
+    # a few rounds back) that accidental serialization went away, and this
+    # remux's own ffmpeg process could then run at the same time as another
+    # user's locked render — two ffmpeg processes at once on a container
+    # with roughly a 1GB ceiling, which is exactly what triggered a real
+    # OOM kill (confirmed via a "Killed" line in the deploy logs right
+    # after a remux and a render overlapped). Moving it inside the lock
+    # restores the original one-heavy-thing-at-a-time guarantee.
     async with HEAVY_TASK_LOCK:
+        # Many phone/screen-recorder exports also leave the moov atom at
+        # the end of the file (not just yt-dlp's merged downloads) —
+        # remux so the Facecam crop tool's /source-preview loads fast for
+        # uploads too, not just YouTube-link jobs. Best-effort; see
+        # _faststart_remux's docstring.
+        await asyncio.to_thread(_faststart_remux, source)
         return await asyncio.to_thread(_process_source, source, job_dir, job_id, clip_count,
                                         clip_seconds, instruction, opts, "uploaded file")
 
@@ -2361,19 +2366,6 @@ async def reclip(req: ReclipRequest):
         if not picks:
             raise HTTPException(422, "Couldn't find another distinct moment in this video.")
         start, end = picks[0]["start"], picks[0]["end"]
-
-    # TEMPORARY diagnostic — a user reported facecam/top-text repeatedly
-    # missing from the final render despite setting both in the editor.
-    # Every other check (frontend field names, the crop_w>0/top_text
-    # non-empty gates below, collectClipOptions()) reads correctly by
-    # static inspection, so this logs exactly what actually arrived in
-    # the request for the next real attempt, to settle definitively
-    # whether it's a frontend send bug or something server-side. Remove
-    # once that's confirmed.
-    print(f"[reclip diag] job={req.job_id} crop=({req.crop_x:.3f},{req.crop_y:.3f},{req.crop_w:.3f},{req.crop_h:.3f}) "
-          f"pip=({req.pip_x:.3f},{req.pip_y:.3f},{req.pip_scale:.3f}) "
-          f"top_text={req.top_text!r} top_text_colors={req.top_text_colors} "
-          f"caption_style={req.caption_style!r}")
 
     ass_path = job_dir / f"reclip_{uuid.uuid4().hex[:6]}.ass"
     words_to_ass(words, start, end, ass_path, caption_style=req.caption_style,
@@ -2768,23 +2760,33 @@ async def remove_vocals(file: UploadFile = File(...)):
         # ffmpeg (already in this container for clip rendering) if a video
         # was uploaded instead.
         audio_path = src_path
-        if src_ext.lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
-            audio_path = work_dir / "audio.wav"
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["ffmpeg", "-y", "-i", str(src_path), "-vn", "-acodec", "pcm_s16le", str(audio_path)],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                raise HTTPException(500, f"Could not extract audio from that video: {result.stderr[-800:]}")
-
         out_dir = work_dir / "out"
-        # --segment caps how much audio Demucs holds in memory at once —
-        # without it, peak memory scales with the whole track's length,
-        # which is what was pushing this container past its 1GB ceiling.
-        # -j 1 keeps it to a single worker instead of spinning up parallel
-        # copies of the model. Both trade a bit of speed for a lot less RAM.
+        # Both ffmpeg calls now share ONE lock scope with the demucs run
+        # below — this audio extraction used to sit outside the lock
+        # safely only because it was a synchronous, event-loop-blocking
+        # call (nothing else could run concurrently either way). Once
+        # threaded via asyncio.to_thread(), that accidental serialization
+        # went away, letting it run at the same time as another user's
+        # locked render — real risk on a container already near its
+        # memory ceiling (see the matching fix on /process-upload's
+        # faststart remux). Keeping it in the lock restores the original
+        # one-heavy-thing-at-a-time guarantee.
         async with HEAVY_TASK_LOCK:
+            if src_ext.lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
+                audio_path = work_dir / "audio.wav"
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["ffmpeg", "-y", "-i", str(src_path), "-vn", "-acodec", "pcm_s16le", str(audio_path)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    raise HTTPException(500, f"Could not extract audio from that video: {result.stderr[-800:]}")
+
+            # --segment caps how much audio Demucs holds in memory at once —
+            # without it, peak memory scales with the whole track's length,
+            # which is what was pushing this container past its 1GB ceiling.
+            # -j 1 keeps it to a single worker instead of spinning up parallel
+            # copies of the model. Both trade a bit of speed for a lot less RAM.
             result = await asyncio.to_thread(
                 subprocess.run,
                 ["python3", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
@@ -2829,17 +2831,20 @@ async def enhance_speech(file: UploadFile = File(...)):
         src_path.write_bytes(raw)
 
         wav_path = work_dir / "input.wav"
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["ffmpeg", "-y", "-i", str(src_path), "-ar", "48000", "-ac", "1", str(wav_path)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            raise HTTPException(500, f"Could not read that audio file: {result.stderr[-800:]}")
-
         out_dir = work_dir / "out"
         out_dir.mkdir(exist_ok=True)
+        # Both ffmpeg calls share one lock scope now — see the matching
+        # fix on /process-upload's faststart remux for why this resample
+        # can't safely sit outside the lock once it's threaded.
         async with HEAVY_TASK_LOCK:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-y", "-i", str(src_path), "-ar", "48000", "-ac", "1", str(wav_path)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                raise HTTPException(500, f"Could not read that audio file: {result.stderr[-800:]}")
+
             result = await asyncio.to_thread(
                 subprocess.run,
                 ["deepFilter", str(wav_path), "--output-dir", str(out_dir)],

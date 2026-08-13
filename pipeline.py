@@ -2181,7 +2181,7 @@ async def process(req: ProcessRequest):
     # /process-upload below for the same fix.
     async with HEAVY_TASK_LOCK:
         try:
-            source, download_tier = download_video(req.url, job_dir)
+            source, download_tier = await asyncio.to_thread(download_video, req.url, job_dir)
         except Exception as e:
             raise HTTPException(400, f"Could not download video: {e}")
 
@@ -2198,8 +2198,8 @@ async def process(req: ProcessRequest):
             caption_x=req.caption_x, caption_y=req.caption_y, caption_scale=req.caption_scale,
             top_text_x=req.top_text_x, top_text_y=req.top_text_y, top_text_scale=req.top_text_scale,
         )
-        return _process_source(source, job_dir, job_id, req.clip_count, req.clip_seconds, req.instruction,
-                                opts, req.url, download_tier)
+        return await asyncio.to_thread(_process_source, source, job_dir, job_id, req.clip_count,
+                                        req.clip_seconds, req.instruction, opts, req.url, download_tier)
 
 
 # Upload size cap: keeps a single request from blowing out Railway's small
@@ -2281,7 +2281,7 @@ async def process_upload(
     # end of the file (not just yt-dlp's merged downloads) — remux so the
     # Facecam crop tool's /source-preview loads fast for uploads too, not
     # just YouTube-link jobs. Best-effort; see _faststart_remux's docstring.
-    _faststart_remux(source)
+    await asyncio.to_thread(_faststart_remux, source)
 
     opts = dict(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,
@@ -2299,8 +2299,8 @@ async def process_upload(
     # See /process above — same memory-safety lock around the actual
     # transcription/render/voiceover/mix work, not the upload itself.
     async with HEAVY_TASK_LOCK:
-        return _process_source(source, job_dir, job_id, clip_count, clip_seconds, instruction,
-                                opts, "uploaded file")
+        return await asyncio.to_thread(_process_source, source, job_dir, job_id, clip_count,
+                                        clip_seconds, instruction, opts, "uploaded file")
 
 
 @app.get("/source-preview/{job_id}")
@@ -2370,22 +2370,24 @@ async def reclip(req: ReclipRequest):
     # audio mix), not a cheap operation, and was previously unprotected.
     async with HEAVY_TASK_LOCK:
         try:
-            cut_and_caption(source, start, end, ass_path, out_path,
-                             zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
-                             crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
-                             pip_x=req.pip_x, pip_y=req.pip_y, pip_scale=req.pip_scale)
+            await asyncio.to_thread(
+                cut_and_caption, source, start, end, ass_path, out_path,
+                zoom_pan=req.zoom_pan, color_preset=req.color_preset, flash_intro=req.flash_intro,
+                crop_x=req.crop_x, crop_y=req.crop_y, crop_w=req.crop_w, crop_h=req.crop_h,
+                pip_x=req.pip_x, pip_y=req.pip_y, pip_scale=req.pip_scale)
         except Exception as e:
             raise HTTPException(500, f"Failed to render clip: {e}")
 
-        voiceover_script = apply_voiceover_if_wanted(
+        voiceover_script = await asyncio.to_thread(
+            apply_voiceover_if_wanted,
             source, job_dir, out_path, start, end, req.clip_seconds,
             words, req.voiceover, req.voiceover_voice, req.instruction, req.voiceover_style,
         )
 
         bg_music_path = find_bg_music(job_dir)
         mixed_path = out_path.with_suffix(".mix.mp4")
-        if apply_audio_extras(out_path, mixed_path, end - start, req.sfx, req.sfx_position,
-                               req.typing_sound, bg_music_path):
+        if await asyncio.to_thread(apply_audio_extras, out_path, mixed_path, end - start, req.sfx,
+                                    req.sfx_position, req.typing_sound, bg_music_path):
             mixed_path.replace(out_path)
 
     return {
@@ -2447,7 +2449,7 @@ async def apply_sound_effects(req: ApplySoundEffectsRequest):
 
     out_tmp = clip_path.with_suffix(".sfxmix.mp4")
     async with HEAVY_TASK_LOCK:
-        ok = _mix_sfx_placements(orig_path, out_tmp, resolved)
+        ok = await asyncio.to_thread(_mix_sfx_placements, orig_path, out_tmp, resolved)
         if not ok:
             raise HTTPException(500, "Failed to mix sound effects into the clip.")
         out_tmp.replace(clip_path)
@@ -2513,7 +2515,7 @@ async def apply_gameplay_bg(req: ApplyGameplayBgRequest):
 
     out_tmp = clip_path.with_suffix(".gpbg.mp4")
     async with HEAVY_TASK_LOCK:
-        ok = apply_gameplay_split(base_path, out_tmp, bg_path)
+        ok = await asyncio.to_thread(apply_gameplay_split, base_path, out_tmp, bg_path)
         if not ok:
             raise HTTPException(500, "Failed to composite the gameplay background onto this clip.")
         out_tmp.replace(clip_path)
@@ -2668,7 +2670,7 @@ async def download_social_video_endpoint(url: str = Form(...)):
     try:
         async with HEAVY_TASK_LOCK:
             try:
-                source, _download_tier = download_video(url, work_dir)
+                source, _download_tier = await asyncio.to_thread(download_video, url, work_dir)
             except Exception as e:
                 raise HTTPException(400, f"Could not download that video: {e}")
 
@@ -2702,7 +2704,7 @@ async def remove_background(file: UploadFile = File(...)):
 
     try:
         async with HEAVY_TASK_LOCK:
-            result = rembg_remove(raw, session=get_rembg_session())
+            result = await asyncio.to_thread(rembg_remove, raw, session=get_rembg_session())
     except Exception as e:
         raise HTTPException(500, f"Background removal failed: {e}")
 
@@ -2747,7 +2749,8 @@ async def remove_vocals(file: UploadFile = File(...)):
         audio_path = src_path
         if src_ext.lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
             audio_path = work_dir / "audio.wav"
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["ffmpeg", "-y", "-i", str(src_path), "-vn", "-acodec", "pcm_s16le", str(audio_path)],
                 capture_output=True, text=True, timeout=120,
             )
@@ -2761,7 +2764,8 @@ async def remove_vocals(file: UploadFile = File(...)):
         # -j 1 keeps it to a single worker instead of spinning up parallel
         # copies of the model. Both trade a bit of speed for a lot less RAM.
         async with HEAVY_TASK_LOCK:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["python3", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
                  "--segment", "8", "-j", "1", "-o", str(out_dir), str(audio_path)],
                 capture_output=True, text=True, timeout=600,
@@ -2804,7 +2808,8 @@ async def enhance_speech(file: UploadFile = File(...)):
         src_path.write_bytes(raw)
 
         wav_path = work_dir / "input.wav"
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["ffmpeg", "-y", "-i", str(src_path), "-ar", "48000", "-ac", "1", str(wav_path)],
             capture_output=True, text=True, timeout=120,
         )
@@ -2814,7 +2819,8 @@ async def enhance_speech(file: UploadFile = File(...)):
         out_dir = work_dir / "out"
         out_dir.mkdir(exist_ok=True)
         async with HEAVY_TASK_LOCK:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["deepFilter", str(wav_path), "--output-dir", str(out_dir)],
                 capture_output=True, text=True, timeout=180,
             )
@@ -2847,7 +2853,7 @@ async def synthesize_voice(script: str = Form(...), voice: str = Form(DEFAULT_VO
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
         async with HEAVY_TASK_LOCK:
-            audio_path = synthesize_voiceover(script, voice, work_dir)
+            audio_path = await asyncio.to_thread(synthesize_voiceover, script, voice, work_dir)
             if not audio_path:
                 raise HTTPException(502, "Voice synthesis failed on every configured provider (Google/ElevenLabs/Piper) — check the pipeline service logs.")
 

@@ -130,6 +130,13 @@ JOBS_DIR = Path(__file__).parent / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 JOB_TTL_SECONDS = 3 * 60 * 60  # old job folders are swept on a delay, not kept forever
 
+# Plan-agnostic hard ceiling on clips-per-generate — see the comment on
+# this constant's one use site in _process_source() for why it exists.
+# A little above the highest plan tier's limit (8, as of this constant's
+# introduction — see CLIP_COUNT_MAX_BY_PLAN in index.html) so it never
+# gets in the way of legitimate use, just abuse/mistakes.
+MAX_CLIP_COUNT = 10
+
 # Scratch space for the standalone AI tools (background remover, vocal
 # remover, speech enhancer) — each request gets its own subfolder here,
 # deleted again once the response is built. Unlike JOBS_DIR these aren't
@@ -2046,6 +2053,15 @@ def _process_source(source: Path, job_dir: Path, job_id: str, clip_count: int, c
     ("cache" | "free" | "own_proxy" | "paid_proxy"), or None for an
     uploaded file that never went through download_video() at all — see
     billable_proxy_bytes below for why this matters."""
+    # This service has no concept of accounts/plans — that lives entirely
+    # in server.js, which is what actually gates clip_count by plan
+    # client-side (see CLIP_COUNT_MAX_BY_PLAN in index.html). This is just
+    # a hard, plan-agnostic ceiling so a raw API call (bypassing the
+    # frontend dropdown entirely) can't request something absurd like 500
+    # clips — every clip is a full serialized ffmpeg render behind the one
+    # shared HEAVY_TASK_LOCK, so an unbounded value would just queue the
+    # whole site behind one request for a very long time, not fail fast.
+    clip_count = max(1, min(clip_count, MAX_CLIP_COUNT))
     try:
         duration = get_duration(source)
     except Exception as e:

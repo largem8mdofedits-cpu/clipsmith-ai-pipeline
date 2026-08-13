@@ -1874,15 +1874,19 @@ def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool
     # just the encoder's), keeps peak memory well under the ceiling.
     # 720x1280 is still plenty sharp for a phone screen.
     #
-    # The TOP half (the real clip) uses force_original_aspect_ratio=
-    # DECREASE + pad, not crop — it used to crop-to-fill like the bottom
-    # half does, but that silently cropped away the burned-in captions AND
-    # the top-text overlay every time, since both sit right at the very
+    # The TOP half (the real clip) can't use plain crop-to-fill like the
+    # bottom half does — that silently cropped away the burned-in captions
+    # AND the top-text overlay every time, since both sit right at the very
     # top/bottom edges of the 1080x1920 frame (by design — that's where
     # subtitles and pinned titles go) and a center-crop down to a squarish
-    # 720x640 box discards exactly those edge bands first. Fit+pad (small
-    # black bars on the sides instead) guarantees nothing burned into the
-    # clip ever gets cut off. The BOTTOM half (gameplay b-roll) still
+    # 720x640 box discards exactly those edge bands first. It USED to fall
+    # back to fit+pad (small black bars left/right) to avoid that, but users
+    # correctly complained the black bars look broken. Fix: fill the bars
+    # with a blurred, cropped-to-fill copy of the SAME frame instead of flat
+    # black (a "blurred background" letterbox, same trick most short-form
+    # video apps use), then composite the untouched fit-scaled clip on top,
+    # centered. Nothing burned into the clip gets cropped, and there's no
+    # visible black anywhere. The BOTTOM half (gameplay b-roll) still
     # crops-to-fill since there's no fixed UI element there that matters if
     # it gets cropped.
     vf_out = (
@@ -1894,8 +1898,11 @@ def apply_gameplay_split(clip_path: Path, out_path: Path, bg_path: Path) -> bool
         "-threads", "1", "-i", str(clip_path.resolve()),
         "-threads", "1", "-ss", f"{bg_start:.2f}", "-stream_loop", "-1", "-i", str(bg_path.resolve()),
         "-filter_complex",
-        "[0:v]scale=720:640:force_original_aspect_ratio=decrease,"
-        "pad=720:640:(ow-iw)/2:(oh-ih)/2:color=black[top];"
+        "[0:v]split=2[0vbg][0vfg];"
+        "[0vbg]scale=720:640:force_original_aspect_ratio=increase,crop=720:640,"
+        "gblur=sigma=20[topbg];"
+        "[0vfg]scale=720:640:force_original_aspect_ratio=decrease[topfg];"
+        "[topbg][topfg]overlay=(W-w)/2:(H-h)/2[top];"
         "[1:v]scale=720:640:force_original_aspect_ratio=increase,crop=720:640[bot];"
         f"[top][bot]vstack=inputs=2[stacked];[stacked]{vf_out}[v]",
         "-map", "[v]", "-map", "0:a?",

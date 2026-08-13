@@ -590,6 +590,41 @@ def _ytdlp_attempt(url: str, out_path: Path, dest: Path, proxy_url: str = "") ->
     return last_error
 
 
+def _faststart_remux(path: Path) -> None:
+    """Rewrites an mp4's moov atom to the FRONT of the file (`-movflags
+    +faststart`) via a stream-copy remux — no re-encoding, just a
+    container rewrite, so it's fast (seconds, not minutes) even on a
+    large file.
+
+    Without this, a browser often can't get a video's duration or seek to
+    any point until it's downloaded the ENTIRE file — yt-dlp's merger
+    (and plenty of camera/phone exports) leaves the moov atom at the END
+    by default. That's exactly what made /source-preview (the Facecam
+    crop tool's uncropped-source view) feel like it "takes a million
+    years to load" on anything longer than a couple minutes: the browser
+    was silently trying to pull the whole multi-hundred-MB/GB source
+    before it could even start playing, let alone seek to the clip's
+    start time.
+
+    Best-effort: if this fails or times out for any reason, the original
+    file is left completely untouched rather than breaking the job over
+    what's ultimately a streaming optimization, not a correctness one."""
+    tmp_path = path.with_suffix(".faststart.mp4")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(path), "-c", "copy", "-movflags", "+faststart", str(tmp_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+            tmp_path.replace(path)
+        else:
+            print(f"faststart remux skipped (non-fatal), ffmpeg said: {result.stderr[-500:]}")
+            tmp_path.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"faststart remux skipped (non-fatal): {e}")
+        tmp_path.unlink(missing_ok=True)
+
+
 def download_video(url: str, dest: Path) -> Tuple[Path, str]:
     """Downloads the source video with yt-dlp (installed separately, see
     README), checking the shared source cache first (see SOURCE_CACHE_DIR
@@ -635,9 +670,11 @@ def download_video(url: str, dest: Path) -> Tuple[Path, str]:
         print("Free tier failed — retrying via YTDLP_OWN_PROXY_URL...")
         last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_OWN_PROXY_URL) or ""
         if not last_error:
+            _faststart_remux(out_path)  # before caching, so cache hits inherit this too
             _source_cache_put(url, out_path)
             return out_path, "own_proxy"
     elif not last_error:
+        _faststart_remux(out_path)
         _source_cache_put(url, out_path)
         return out_path, "free"
 
@@ -645,6 +682,7 @@ def download_video(url: str, dest: Path) -> Tuple[Path, str]:
         print("Own-proxy tier failed (or unset) — retrying via YTDLP_PAID_PROXY_URL...")
         last_error = _ytdlp_attempt(url, out_path, dest, proxy_url=YTDLP_PAID_PROXY_URL) or ""
         if not last_error:
+            _faststart_remux(out_path)
             _source_cache_put(url, out_path)
             return out_path, "paid_proxy"
 
@@ -2238,6 +2276,12 @@ async def process_upload(
     if size == 0:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, "Uploaded file is empty.")
+
+    # Many phone/screen-recorder exports also leave the moov atom at the
+    # end of the file (not just yt-dlp's merged downloads) — remux so the
+    # Facecam crop tool's /source-preview loads fast for uploads too, not
+    # just YouTube-link jobs. Best-effort; see _faststart_remux's docstring.
+    _faststart_remux(source)
 
     opts = dict(
         voiceover=voiceover, voiceover_voice=voiceover_voice, voiceover_style=voiceover_style,

@@ -1961,6 +1961,15 @@ def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: st
         mix_labels.append(f"[a{idx}]")
         idx += 1
 
+    # TEMPORARY diagnostic — a user reported still not hearing uploaded
+    # background music even after the normalize=0/volume fix below. This
+    # confirms, for the next real attempt, whether bg_music_path was even
+    # found/passed in at all (vs. a stale/expired job or a frontend issue
+    # never actually reaching this function with a real path). Remove
+    # once confirmed either way.
+    print(f"[audio_extras diag] out={out_path.name} bg_music_path={bg_music_path} "
+          f"bg_music_exists={bool(bg_music_path and bg_music_path.exists())} mix_inputs={idx}")
+
     if idx == 1:
         return False  # nothing requested (or everything failed to prepare)
 
@@ -1989,6 +1998,7 @@ def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: st
     if result.returncode != 0:
         print(f"Audio extras mix failed: {result.stderr[-1500:]}")
         return False
+    print(f"[audio_extras diag] mix succeeded, wrote {out_path.name} ({out_path.stat().st_size if out_path.exists() else 0} bytes)")
     return True
 
 

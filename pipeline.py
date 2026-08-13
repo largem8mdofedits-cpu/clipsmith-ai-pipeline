@@ -1951,8 +1951,12 @@ def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: st
 
     if bg_music_path and bg_music_path.exists():
         input_args += ["-stream_loop", "-1", "-i", str(bg_music_path.resolve())]
+        # 0.22, not the original 0.16 — bumped after a user reported
+        # uploaded music not being noticeable. The bigger issue turned out
+        # to be amix's own normalize=1 default (see the comment below);
+        # this bump is a smaller, secondary adjustment on top of that fix.
         filter_parts.append(
-            f"[{idx}:a]atrim=0:{duration},aformat=sample_rates=44100:channel_layouts=stereo,volume=0.16[a{idx}]"
+            f"[{idx}:a]atrim=0:{duration},aformat=sample_rates=44100:channel_layouts=stereo,volume=0.22[a{idx}]"
         )
         mix_labels.append(f"[a{idx}]")
         idx += 1
@@ -1960,8 +1964,18 @@ def apply_audio_extras(clip_path: Path, out_path: Path, duration: float, sfx: st
     if idx == 1:
         return False  # nothing requested (or everything failed to prepare)
 
+    # normalize=0 — ffmpeg's amix defaults to normalize=1, which silently
+    # scales EVERY input down by 1/(number of inputs) to guarantee no
+    # clipping. That means the volume= levels set above weren't the real
+    # final levels: with just music added (2 inputs) the 0.16 became more
+    # like 0.08; with sfx AND typing-sound AND music all active (4 inputs)
+    # it was closer to 0.04 — quiet enough to be genuinely inaudible under
+    # normal clip audio, and inconsistent (louder or quieter depending on
+    # what else happened to be layered in) even when it wasn't. Disabling
+    # it makes the volume= filters above the actual final levels, which is
+    # what a fixed "background music" mix level should mean.
     filter_parts.append(
-        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0[aout]"
+        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
     )
     filter_complex = ";".join(filter_parts)
 
@@ -2001,8 +2015,13 @@ def _mix_sfx_placements(clip_path: Path, out_path: Path, placements: List[tuple]
         )
         mix_labels.append(f"[a{idx}]")
 
+    # normalize=0 — see the matching comment in apply_audio_extras() above;
+    # without it, ffmpeg's amix silently divides every track's volume by
+    # the number of effects currently placed, so effects got quieter the
+    # more of them were on the timeline instead of staying at a fixed
+    # level.
     filter_parts.append(
-        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0[aout]"
+        "".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0[aout]"
     )
     filter_complex = ";".join(filter_parts)
 
